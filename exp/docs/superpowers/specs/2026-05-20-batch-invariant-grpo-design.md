@@ -23,6 +23,36 @@ Thinking Machines 博客 *Defeating Nondeterminism in LLM Inference* 指出：RL
 
 → **trainer 侧若不补齐 RMSNorm 与 Attention 的 batch-invariant 替换，rollout vs forward 的 logprob 不可能逐 token 一致**。因此本实验必须以"补齐这两个 op"为前置工程（Phase 0），否则后续训练对比会被无关 numerics 噪声淹没。
 
+### 1.2 forward 完整路径的覆盖盘点（含 MLP）
+
+为避免漏算其他 reduction 路径，逐模块列出 Qwen3.5-2B Dense forward 的覆盖情况：
+
+| 模块 | 内部 op | reduction? | 覆盖来源 |
+|---|---|---|---|
+| Token embedding | gather | 否 | 天然 batch-invariant |
+| RMSNorm (pre-attn / pre-mlp / final) | `mean(x²) + rsqrt + scale` | 是 | **Phase 0** |
+| Q/K/V/O projection | matmul | 是 | `mm`/`addmm` ✓ |
+| RoPE | pointwise rotate | 否 | 天然 |
+| Attention (SDPA) | `softmax(QKᵀ/√d) · V` | 是 | **Phase 0** |
+| MLP gate/up/down_proj | matmul (×3) | 是 | `mm`/`addmm` ✓ |
+| MLP SiLU + gate×up | pointwise | 否 | 天然 |
+| LM head | matmul | 是 | `mm`/`addmm` ✓ |
+| Loss (CE) | log_softmax + gather | 是 | `_log_softmax` ✓ |
+
+→ **MLP 不需要单独 patch**：MLP 的所有 batch-shape-dependent 部分都是 3 个 matmul，由 `mm`/`addmm` 已覆盖；SwiGLU 的非线性与逐元素乘是 pointwise，天然 invariant。
+
+### 1.3 绕过路径与显式锁定（覆盖性前提）
+
+以下三条会让 matmul/RMSNorm patch 被绕过，必须在训练命令与 `verify_env.py` 启动检查中显式拒绝：
+
+| 绕过路径 | 何时触发 | 拒绝方式 |
+|---|---|---|
+| **Fused SwiGLU MLP** (liger-kernel `LigerSwiGLUMLP`, apex fused MLP) | 启用 fused/liger 路径时，gate/up/down/SiLU/mul 融成单个自定义 Triton kernel，不走 `aten::mm` | 训练命令显式 `--use_liger_kernel false`；`verify_env.py` 检测到 liger 已 import 或被 transformers 启用即 fail-fast |
+| **Grouped GEMM** (`aten::_grouped_mm`) | MoE / `--experts_impl grouped_mm` | 本实验 Qwen3.5-2B 是 Dense，天然不触发；spec 锁定模型为 Dense 2B |
+| **量化 MLP** (`aten::_weight_int8_mm` 等) | INT8/INT4 训练 | 本实验 `--torch_dtype bfloat16`，不触发 |
+
+后两项对本实验配置不会触发；第一项需要在 verify_env.py 中加 fail-fast 检查，并在训练命令中显式关闭。
+
 ## 2. 实验设计
 
 ### 2.0 Phase 0：补齐 batch_invariant_ops（前置工程）
@@ -199,7 +229,7 @@ BIM_MODE=baseline   python launcher.py rlhf --rlhf_type grpo --model Qwen/Qwen3.
 | **R5**: HF forward 重算 logprob 时显存爆 | 8192 max_completion_length × 200 prompt | 诊断脚本里改成微批 16 + grad disabled |
 | **R6**: SDPA patch 与 transformers attention 实现不兼容 | Qwen3.5 的 attention 模块直接调 `F.scaled_dot_product_attention` 还是走自定义路径未知；FlexAttention 在 bf16 + causal mask + 滑窗 (sliding window attention, Qwen3.5 用) 下的支持范围有限 | 先验证 transformers 实际调用栈；若 FlexAttention 不支持 SWA，退化为 SDPA-MATH 后端（慢但 batch-invariant），同时把 5-step pilot 测速作为决策点 |
 | **R7**: RMSNorm patch 未命中 transformers fused 实现 | transformers 可能不调 `aten::rms_norm`，而是自定义 `Qwen2RMSNorm.forward` | 双重保险：既 patch `aten::rms_norm`，也对 transformers 的 `Qwen2RMSNorm` / `Qwen3RMSNorm` 类做 monkey-patch；单元测试用真实模型 forward 而不是裸 `F.rms_norm` 验证 |
-| **R8**: liger-kernel 等 fused 路径绕过我们的 patch | swift 默认是否启用 liger-kernel 需要确认 | 训练命令显式 `--use_liger_kernel false`；env/verify_env.py 检测并报错 |
+| **R8**: liger-kernel / 其他 fused MLP 路径绕过 `aten::mm` patch | swift 默认是否启用 liger-kernel 需要确认；transformers 自身的 `attn_implementation` 之外，MLP 部分若被 fused 也会绕过 | 训练命令显式 `--use_liger_kernel false`；`verify_env.py` 检测 liger / apex fused MLP / 其他自定义 SwiGLU kernel 是否已加载并 fail-fast；不依赖 transformers 默认值 |
 
 ## 9. 执行顺序
 
