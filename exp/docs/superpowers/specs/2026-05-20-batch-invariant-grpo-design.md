@@ -9,7 +9,43 @@ Thinking Machines 博客 *Defeating Nondeterminism in LLM Inference* 指出：RL
 
 启用 batch-invariant kernels（同时在 vLLM 和 trainer 两侧）后，rollout 与 forward 的 logprob 应**逐 token 完全相等**，importance ratio 在第 0 步应恰为 1。本实验设计用于量化这一假设带来的训练动态与最终指标差异。
 
+### 1.1 必须覆盖的三大 kernel
+
+博客与 vLLM 实现都明确：消除 batch-shape 依赖要求**完整覆盖**以下 reduction-heavy kernel：
+
+| Kernel | batch-dependent 原因 | vLLM (rollout) 已覆盖 | `batch_invariant_ops` (trainer) 当前 |
+|---|---|---|---|
+| MatMul / `mm` / `addmm` | 小 batch 触发 Split-K | ✅ batch-invariant matmul | ✅ `matmul_persistent` |
+| **RMSNorm** | 小 batch 触发 split-reduction | ✅ Triton RMSNorm | **❌ 缺**（Qwen3.5 大量使用）|
+| **Attention (SDPA)** | Split-KV / FlashDecoding 的 split 数随 batch 变 | ✅ FlexAttention + fixed split-tile-size | **❌ 缺**（trainer 走 SDPA / FA2）|
+| log_softmax | head reduction | ✅ | ✅ |
+| mean.dim | 一般 reduction | ✅ | ✅ |
+
+→ **trainer 侧若不补齐 RMSNorm 与 Attention 的 batch-invariant 替换，rollout vs forward 的 logprob 不可能逐 token 一致**。因此本实验必须以"补齐这两个 op"为前置工程（Phase 0），否则后续训练对比会被无关 numerics 噪声淹没。
+
 ## 2. 实验设计
+
+### 2.0 Phase 0：补齐 batch_invariant_ops（前置工程）
+
+**目标**：在 `batch_invariant_ops` 中新增 RMSNorm 与 SDPA 的 batch-invariant 实现，让 `enable_batch_invariant_mode()` 之后，trainer 侧的 forward 真正达到 batch-invariant。
+
+**新增内容**（放在 `exp/grpo_batch_invariance/ops_extension/`，独立 Python 包，import 后再调 `enable_batch_invariant_mode()` 注册到 torch.library）：
+
+1. **`rms_norm_batch_invariant`**
+   - 替换 `aten::rms_norm`（PyTorch 2.4+ 原生 op）
+   - 同时对 transformers 的 `Qwen2RMSNorm`/`Qwen3RMSNorm` 做 monkey-patch（如果它没走 `aten::rms_norm`）
+   - Triton 实现参考 vLLM `model_executor/layers/batch_invariant.py` 中的 RMSNorm kernel：one-row-per-block 数据并行 + 固定 reduction tree，禁用 split-reduction
+   - 数学定义：`y = x / sqrt(mean(x²) + eps) * weight`
+
+2. **`sdpa_batch_invariant`**
+   - 替换 `aten::scaled_dot_product_attention`
+   - 实现策略：使用 PyTorch `FlexAttention` 并强制 `BLOCK_M / BLOCK_N` 与 KV 分块为固定值（不随 batch/seq 变），等价于 vLLM 的 fixed split-tile-size 策略
+   - 强制后端：在 patch 中显式 `with sdpa_kernel(SDPBackend.MATH):` 作为 fallback 路径（math 路径本身确定但慢；FlexAttention 是优先路径）
+   - swift 训练命令需配合：去掉 `--attn_impl flash_attention_2`，改为不传或显式 `--attn_impl sdpa`，让 transformers 走 `nn.functional.scaled_dot_product_attention`，从而命中我们的 patch
+
+3. **单元测试** `tests/test_invariance.py`：
+   - 对 RMSNorm 和 SDPA 分别构造 `batch=1` vs `batch=8` 的输入（同首行），断言输出逐 bit 相等（torch.equal）
+   - 这是 Phase 0 的 done-gate
 
 ### 2.1 配方对齐
 
@@ -20,6 +56,7 @@ Thinking Machines 博客 *Defeating Nondeterminism in LLM Inference* 指出：RL
 - 关键超参: `lr=1e-6`, `num_generations=8`, `temperature=1.0`, `epsilon=0.2`, `epsilon_high=0.28`, `scale_rewards none`, `per_device_train_batch_size=4`, `gradient_accumulation=4`
 - 后端: vLLM colocate, `gpu_mem_util=0.4`, deepspeed zero2
 - 硬件: 4 × H100/A100 (80G)
+- **Attention 后端**: 与默认配方略不同——必须显式 `--attn_impl sdpa`，让 forward 走 `nn.functional.scaled_dot_product_attention`，从而命中 Phase 0 的 patch。这是 baseline 与 invariant 组**共同**的设置，避免引入第二个变量。
 
 ### 2.2 A/B 变量
 
@@ -45,6 +82,14 @@ exp/grpo_batch_invariance/
 ├── env/
 │   ├── setup.sh                   # pip install ms-swift, vllm>=0.17, batch_invariant_ops -e
 │   └── verify_env.py              # 启动前自检：PyTorch>=2.9, vllm batch-inv 支持, GPU 数量
+├── ops_extension/                 # Phase 0：补齐 RMSNorm + SDPA 的 batch-invariant 实现
+│   ├── __init__.py                # enable_full_batch_invariant_mode() 入口
+│   ├── rms_norm.py                # Triton kernel + aten::rms_norm patch + transformers monkey-patch
+│   ├── sdpa.py                    # FlexAttention with fixed split-tile-size + aten::scaled_dot_product_attention patch
+│   └── tests/
+│       ├── test_rms_norm_invariance.py    # batch=1 vs batch=8 逐 bit 相等断言
+│       ├── test_sdpa_invariance.py        # 同上
+│       └── test_end_to_end_forward.py     # Qwen3.5-2B 整体 forward 在 batch=1 / 8 / 32 上 bit-equal
 ├── launcher.py                    # 零侵入接入 swift 的启动器（见 §4）
 ├── diagnostics/
 │   ├── logprob_mismatch.py        # 核心诊断：4 cell 对比 logprob diff
@@ -81,10 +126,12 @@ assert mode in ("baseline", "invariant")
 if mode == "invariant":
     # 开关 1：vLLM 侧 C++/CUDA kernel 路径
     os.environ["VLLM_BATCH_INVARIANT"] = "1"
-    # 开关 2：trainer 侧 torch.library aten 替换。enable_* 是进程级全局，
-    # 不用 context manager（colocate 模式下两侧共享同进程 Python 调用栈）
+    # 开关 2：trainer 侧 torch.library aten 替换 + Phase 0 扩展（RMSNorm + SDPA）
     from batch_invariant_ops import enable_batch_invariant_mode
-    enable_batch_invariant_mode()
+    enable_batch_invariant_mode()                       # mm/addmm/log_softmax/mean
+    from ops_extension import enable_extended_batch_invariant_mode
+    enable_extended_batch_invariant_mode()              # rms_norm/scaled_dot_product_attention
+                                                        # + transformers Qwen RMSNorm monkey-patch
 
 # 透传剩余参数给 swift CLI
 from swift.cli.main import cli_main
@@ -99,7 +146,7 @@ BIM_MODE=invariant python launcher.py rlhf --rlhf_type grpo --model Qwen/Qwen3.5
 BIM_MODE=baseline   python launcher.py rlhf --rlhf_type grpo --model Qwen/Qwen3.5-2B ...
 ```
 
-**风险 1 处理**: 如果 colocate 模式下 `enable_batch_invariant_mode()` 与 vLLM 内部 batch-invariant kernel 冲突（双重 patch），降级方案是只设 `VLLM_BATCH_INVARIANT=1`，在 swift trainer 的 `compute_loss` hook 中用 `with set_batch_invariant_mode():` 局部包裹（通过 `external_plugins` 注入）。
+**风险 1 处理**: 如果 colocate 模式下 trainer 侧的 patch 与 vLLM 内部 batch-invariant kernel 冲突（双重 patch），降级方案是把 trainer 侧的两次 `enable_*` 改为 context manager 包裹（在 swift trainer 的 `compute_loss` / 自定义 logprob 计算位置用 `with set_batch_invariant_mode():` + `with extended_batch_invariant():` 嵌套），通过 `external_plugins` 注入。注意：transformers 模块的 monkey-patch（RMSNorm 类替换）无法用 context manager，必须进程级开启——若必须降级到局部包裹，需保留 RMSNorm 替换不变，只把 aten 级 op 替换收成局部。
 
 ## 5. 诊断脚本（diagnostics/logprob_mismatch.py）
 
@@ -150,25 +197,31 @@ BIM_MODE=baseline   python launcher.py rlhf --rlhf_type grpo --model Qwen/Qwen3.
 | **R3**: Qwen3.5-2B 不在 vLLM batch-inv 验证清单 | 诊断脚本 D cell 仍有 delta | 降级到 Qwen3-1.7B（已验证），保持其他配方不变 |
 | **R4**: vLLM ≥0.17 与 batch_invariant_ops 当前版本不兼容 | env/verify_env.py 报错 | 钉一个 vllm + torch 版本组合（在 setup.sh 中记录） |
 | **R5**: HF forward 重算 logprob 时显存爆 | 8192 max_completion_length × 200 prompt | 诊断脚本里改成微批 16 + grad disabled |
+| **R6**: SDPA patch 与 transformers attention 实现不兼容 | Qwen3.5 的 attention 模块直接调 `F.scaled_dot_product_attention` 还是走自定义路径未知；FlexAttention 在 bf16 + causal mask + 滑窗 (sliding window attention, Qwen3.5 用) 下的支持范围有限 | 先验证 transformers 实际调用栈；若 FlexAttention 不支持 SWA，退化为 SDPA-MATH 后端（慢但 batch-invariant），同时把 5-step pilot 测速作为决策点 |
+| **R7**: RMSNorm patch 未命中 transformers fused 实现 | transformers 可能不调 `aten::rms_norm`，而是自定义 `Qwen2RMSNorm.forward` | 双重保险：既 patch `aten::rms_norm`，也对 transformers 的 `Qwen2RMSNorm` / `Qwen3RMSNorm` 类做 monkey-patch；单元测试用真实模型 forward 而不是裸 `F.rms_norm` 验证 |
+| **R8**: liger-kernel 等 fused 路径绕过我们的 patch | swift 默认是否启用 liger-kernel 需要确认 | 训练命令显式 `--use_liger_kernel false`；env/verify_env.py 检测并报错 |
 
 ## 9. 执行顺序
 
 实验按以下顺序，每一步都是后一步的 gate：
 
 1. `env/setup.sh` + `env/verify_env.py` — 环境就位
-2. `diagnostics/logprob_mismatch.py` — **gate**：D cell 必须满足 `mean(|Δlogprob|) < 1e-6` 且 `frac(|Δ|>1e-3) == 0`（即 bit-equal），同时 A cell 必须满足 `mean(|Δlogprob|) > 1e-4`（确认机制存在），否则停下来定位 R1/R3
-3. `diagnostics/repeatability.py` — 旁证
-4. `train/train_grpo.sh BIM_MODE=baseline SEED=42` — pilot 5 step，测速、确认 plugin 正常打点
-5. `train/run_all.sh` — 6 run 全跑
-6. `eval/eval_all.sh` — 30 个 eval 点
-7. `results/summary.md` 自动生成 + 人工撰写 Findings
+2. **Phase 0**: 实现 `ops_extension/rms_norm.py` + `ops_extension/sdpa.py`，跑 `ops_extension/tests/` 全绿 — **gate**：单元测试中 batch=1 与 batch=8 必须 `torch.equal`
+3. `diagnostics/logprob_mismatch.py` — **gate**：D cell 必须满足 `mean(|Δlogprob|) < 1e-6` 且 `frac(|Δ|>1e-3) == 0`（即 bit-equal）；A cell 必须满足 `mean(|Δlogprob|) > 1e-4`（确认机制存在）；否则停下来定位 R1/R3/R6
+4. `diagnostics/repeatability.py` — 旁证
+5. `train/train_grpo.sh BIM_MODE=baseline SEED=42` — pilot 5 step，测速、确认 plugin 正常打点
+6. `train/run_all.sh` — 6 run 全跑
+7. `eval/eval_all.sh` — 30 个 eval 点
+8. `results/summary.md` 自动生成 + 人工撰写 Findings
 
 ## 10. 非目标（YAGNI）
 
 明确**不做**以下事，避免范围蔓延：
-- 不实现新的 batch-invariant kernel（直接用 `batch_invariant_ops` 已有的 mm/addmm/log_softmax/mean）
-- 不改 swift 源码（全部走 launcher + external_plugins）
+- **本实验确实需要新实现 RMSNorm + SDPA 的 batch-invariant kernel**（Phase 0），这是必要前提，不是 YAGNI 项
+- 不向 `batch_invariant_ops` 上游 PR Phase 0 的实现（先放在 `ops_extension/`，实验成功后再考虑 upstream）
+- 不改 swift 源码（全部走 launcher + external_plugins + transformers monkey-patch）
 - 不做 LoRA 对比（只对比 baseline vs invariant 在 full FT 下）
 - 不做超过 GSM8K 的 benchmark
 - 不做多机训练
 - 不做 GKD（文档里有，本实验只看 GRPO）
+- 不优化 Phase 0 kernel 的性能至 cuBLAS/FA2 水平（接受 ~20% 性能损失，与博客一致）
