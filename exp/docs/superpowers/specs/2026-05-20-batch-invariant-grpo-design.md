@@ -127,10 +127,7 @@ exp/grpo_batch_invariance/
 │   └── plot_diagnostics.py        # 输出 logprob_diff_hist.png 等
 ├── train/
 │   ├── train_grpo.sh              # 单 run 训练命令（参数化 MODE / SEED / OUTPUT_DIR）
-│   ├── run_all.sh                 # 顺序跑 6 个 run（也支持 --only 跳过已完成的）
-│   └── plugins/
-│       └── logprob_probe.py       # swift external_plugin，在每 step 记录
-│                                  #   rollout-vs-forward logprob diff 直方图统计
+│   └── run_all.sh                 # 顺序跑 6 个 run（也支持 --only 跳过已完成的）
 ├── eval/
 │   ├── eval_gsm8k.sh              # swift eval per checkpoint
 │   └── eval_all.sh                # 扫所有 run × {step 10,20,30,40,50}
@@ -205,7 +202,7 @@ BIM_MODE=baseline   python launcher.py rlhf --rlhf_type grpo --model Qwen/Qwen3.
 
 | 类别 | 指标 | 来源 | 频率 |
 |---|---|---|---|
-| 训推偏差 | `mean(|Δlogprob|)`, `frac(|Δ|>1e-3)`, `IS-ratio` 分位数 | `plugins/logprob_probe.py` | 每 step |
+| 训推偏差 | `mean(|Δlogprob|)`, `frac(|Δ|>1e-3)`, `IS-ratio` 分位数 | `diagnostics/logprob_mismatch.py`（训练前 + 训练后 ckpt 各跑一次）| 每 run 2 次 |
 | GRPO 内部 | clip 比例、approx KL、reward mean/std、advantage std、grad_norm | swift trainer 默认日志 | 每 step |
 | 最终指标 | GSM8K accuracy | `swift eval` | 每 10 step |
 | 可复现性 | 3 seed 间 final acc 的 std；同 seed bit-equal 率 | `summary.md` 聚合 | 实验结束 |
