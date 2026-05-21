@@ -57,8 +57,13 @@ def rollout_vllm(prompts: List[str]) -> List[Tuple[List[int], List[float]]]:
     result = []
     for out in outputs:
         comp = out.outputs[0]
-        token_ids = list(comp.token_ids)
-        logprobs = [lp_d[tid].logprob for tid, lp_d in zip(comp.token_ids, comp.logprobs)]
+        token_ids: List[int] = []
+        logprobs: List[float] = []
+        for tid, lp_d in zip(comp.token_ids, comp.logprobs):
+            if lp_d is None or tid not in lp_d:
+                continue
+            token_ids.append(tid)
+            logprobs.append(lp_d[tid].logprob)
         result.append((token_ids, logprobs))
     return result
 
