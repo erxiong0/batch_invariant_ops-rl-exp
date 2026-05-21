@@ -87,7 +87,10 @@ def matmul_kernel_persistent(
     offs_k_for_mask = tl.arange(0, BLOCK_SIZE_K)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
-    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
+    # NOTE: `flatten=True` was added in Triton 3.3+ as a loop-flattening hint.
+    # Removed for compatibility with the Triton 3.2 bundled in torch 2.6+cu124.
+    # Functionally equivalent (just one fewer optimization pass).
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS):
         pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         start_m = pid_m * BLOCK_SIZE_M
         start_n = pid_n * BLOCK_SIZE_N
