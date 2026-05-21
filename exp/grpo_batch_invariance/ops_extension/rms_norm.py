@@ -76,9 +76,29 @@ def rms_norm_batch_invariant(
     return out.to(out_dtype).reshape(orig_shape)
 
 
-def _patched_qwen_rms_norm_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-    """Drop-in replacement for transformers Qwen{2,3}RMSNorm.forward."""
+def _patched_qwen2_qwen3_rms_norm_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    """Drop-in replacement for transformers Qwen2RMSNorm / Qwen3RMSNorm.
+
+    Both use the formula:  output = rms_norm(x) * self.weight
+    with weight initialized to ones; attribute name is `variance_epsilon`.
+    """
     return rms_norm_batch_invariant(hidden_states, self.weight, self.variance_epsilon)
+
+
+def _patched_qwen3_5_rms_norm_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    """Drop-in replacement for transformers Qwen3_5RMSNorm.
+
+    Formula:  output = rms_norm(x) * (1.0 + self.weight)
+    with weight initialized to zeros; attribute name is `eps`.
+
+    We use rms_norm_batch_invariant with an all-ones weight to do pure
+    normalization, then apply the (1 + weight) scaling on the Python side.
+    The scaling step is elementwise — batch-invariant by construction.
+    """
+    eps = self.eps
+    ones = torch.ones_like(self.weight)
+    normed = rms_norm_batch_invariant(hidden_states, ones, eps)
+    return normed * (1.0 + self.weight)
 
 
 _PATCHED = False
@@ -86,25 +106,39 @@ _ORIGINAL_FORWARDS: dict = {}
 
 
 def patch_transformers_rms_norm() -> None:
-    """Monkey-patch transformers' Qwen2RMSNorm/Qwen3RMSNorm to use our kernel."""
+    """Monkey-patch transformers' Qwen2/3/3.5 RMSNorm classes to use our kernel.
+
+    Each class has different attributes and a different formula, so we register
+    the appropriate replacement per class. Missing modules are silently skipped
+    (different transformers versions ship different Qwen variants).
+    """
     global _PATCHED
     if _PATCHED:
         return
-    targets = []
+
+    patches: list[tuple[type, callable]] = []
+    # Qwen2 / Qwen3 share the simpler formula
     try:
         from transformers.models.qwen2 import modeling_qwen2
-        targets.append(modeling_qwen2.Qwen2RMSNorm)
+        patches.append((modeling_qwen2.Qwen2RMSNorm, _patched_qwen2_qwen3_rms_norm_forward))
     except ImportError:
         pass
     try:
         from transformers.models.qwen3 import modeling_qwen3
-        targets.append(modeling_qwen3.Qwen3RMSNorm)
+        patches.append((modeling_qwen3.Qwen3RMSNorm, _patched_qwen2_qwen3_rms_norm_forward))
     except ImportError:
         pass
-    assert targets, "no Qwen RMSNorm class found in transformers"
-    for cls in targets:
+    # Qwen3.5 uses (1 + weight) form
+    try:
+        from transformers.models.qwen3_5 import modeling_qwen3_5
+        patches.append((modeling_qwen3_5.Qwen3_5RMSNorm, _patched_qwen3_5_rms_norm_forward))
+    except ImportError:
+        pass
+
+    assert patches, "no Qwen RMSNorm class found in transformers"
+    for cls, fn in patches:
         _ORIGINAL_FORWARDS[cls] = cls.forward
-        cls.forward = _patched_qwen_rms_norm_forward
+        cls.forward = fn
     _PATCHED = True
 
 
