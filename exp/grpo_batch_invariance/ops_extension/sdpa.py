@@ -55,9 +55,11 @@ def sdpa_batch_invariant(
         else:
             scores = scores + attn_mask
 
-    # log_softmax → exp → renormalized? 直接走 softmax，它内部用 _log_softmax 的反路径，
-    # 等价上 = exp(log_softmax(x))，仍在我们的 patch 覆盖下
-    probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
+    # 必须走 F.log_softmax 才能命中 batch_invariant_ops 的 aten::_log_softmax patch；
+    # aten::_softmax 没被 patch，所以 F.softmax 会跳过 batch-invariant 路径。
+    # 用 log-softmax → exp 等价数学上 = softmax(x)。
+    log_probs = F.log_softmax(scores.float(), dim=-1)
+    probs = log_probs.exp().to(query.dtype)
     return torch.matmul(probs, value)
 
 
