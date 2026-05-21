@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 在 swift 官方 Qwen3.5-2B + GSM8K GRPO 配方上做 A/B 实验，验证启用 batch-invariant kernel 对 RL 训练的影响（机制 + 指标 + 可复现性）。
+**Goal:** 在 swift 官方 Qwen3-1.7B + GSM8K GRPO 配方上做 A/B 实验，验证启用 batch-invariant kernel 对 RL 训练的影响（机制 + 指标 + 可复现性）。
 
 **Architecture:** 两阶段。Phase 0 是前置工程：在 `ops_extension/` 中补齐 RMSNorm + SDPA 的 batch-invariant 实现（`batch_invariant_ops` 当前只覆盖 mm/addmm/log_softmax/mean），让 trainer 侧 forward 真正达到 batch-invariant。Phase 1 是实验脚手架：launcher（零侵入 swift）+ 诊断脚本（4-cell logprob 对比 + 旁证）+ 训练（2 mode × 3 seed × 50 step）+ 评测（GSM8K）+ 自动汇总。
 
@@ -76,7 +76,7 @@ touch exp/grpo_batch_invariance/diagnostics/__init__.py
 ```markdown
 # Batch Invariance × GRPO 实验
 
-验证 batch-invariant kernel 对 ms-swift Qwen3.5-2B + GSM8K GRPO 训练的影响。
+验证 batch-invariant kernel 对 ms-swift Qwen3-1.7B + GSM8K GRPO 训练的影响。
 
 详见：
 - Spec: `exp/docs/superpowers/specs/2026-05-20-batch-invariant-grpo-design.md`
@@ -713,7 +713,7 @@ git commit -m "exp: ops_extension entry point — enable/disable extended invari
 
 ---
 
-### Task 0.6: end-to-end Qwen3.5-2B forward bit-equal 测试（Phase 0 总 gate）
+### Task 0.6: end-to-end Qwen3-1.7B forward bit-equal 测试（Phase 0 总 gate）
 
 **Files:**
 - Create: `exp/grpo_batch_invariance/ops_extension/tests/test_end_to_end_forward.py`
@@ -721,7 +721,7 @@ git commit -m "exp: ops_extension entry point — enable/disable extended invari
 - [ ] **Step 1: 写 e2e 测试**
 
 ```python
-"""End-to-end Qwen3.5-2B forward batch invariance test.
+"""End-to-end Qwen3-1.7B forward batch invariance test.
 
 启用 batch_invariant_ops + ops_extension 后，对相同输入 prompt:
   - batch=1 forward 拿 last-token logits
@@ -739,7 +739,7 @@ from ops_extension import (
 )
 
 
-MODEL_ID = "Qwen/Qwen3.5-2B"  # 若拉不到可改 Qwen/Qwen3-1.7B 同样验证
+MODEL_ID = "Qwen/Qwen3-1.7B"
 
 
 @pytest.fixture(scope="module")
@@ -828,7 +828,7 @@ Expected: 2 test PASS。模型下载首次约 5-10 分钟。
 
 ```bash
 git add exp/grpo_batch_invariance/ops_extension/tests/test_end_to_end_forward.py
-git commit -m "exp: end-to-end Qwen3.5-2B forward bit-equal test (Phase 0 gate)"
+git commit -m "exp: end-to-end Qwen3-1.7B forward bit-equal test (Phase 0 gate)"
 ```
 
 **Phase 0 done-gate**: 这个测试通过即 Phase 0 完成。否则不进入 Phase 1。
@@ -848,8 +848,8 @@ git commit -m "exp: end-to-end Qwen3.5-2B forward bit-equal test (Phase 0 gate)"
 """零侵入接入 swift CLI 的启动器。
 
 调用方式：
-    BIM_MODE=baseline   python launcher.py rlhf --rlhf_type grpo --model Qwen/Qwen3.5-2B ...
-    BIM_MODE=invariant  python launcher.py rlhf --rlhf_type grpo --model Qwen/Qwen3.5-2B ...
+    BIM_MODE=baseline   python launcher.py rlhf --rlhf_type grpo --model Qwen/Qwen3-1.7B ...
+    BIM_MODE=invariant  python launcher.py rlhf --rlhf_type grpo --model Qwen/Qwen3-1.7B ...
 
 invariant 模式同时翻三个开关：
   1) VLLM_BATCH_INVARIANT=1                       (vLLM rollout 侧)
@@ -953,7 +953,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 EXP_DIR = Path(__file__).resolve().parents[1]
 RESULTS_DIR = EXP_DIR / "results" / "diagnostics"
 
-MODEL_ID = "Qwen/Qwen3.5-2B"
+MODEL_ID = "Qwen/Qwen3-1.7B"
 N_PROMPTS = 200
 MAX_NEW = 256
 SAMPLING = dict(temperature=1.0, top_p=1.0, top_k=-1, seed=12345)
@@ -1204,7 +1204,7 @@ from pathlib import Path
 
 EXP_DIR = Path(__file__).resolve().parents[1]
 RESULTS = EXP_DIR / "results" / "diagnostics"
-MODEL_ID = "Qwen/Qwen3.5-2B"
+MODEL_ID = "Qwen/Qwen3-1.7B"
 N_TRIALS = 200
 PROMPT = ("Generate 30 random numbers between 0 and 1000, comma-separated. "
           "Just numbers, no prose.")
@@ -1314,7 +1314,7 @@ export DISABLE_LIGER_KERNEL=1
 
 python "$EXP_DIR/launcher.py" rlhf \
   --rlhf_type grpo \
-  --model Qwen/Qwen3.5-2B \
+  --model Qwen/Qwen3-1.7B \
   --external_plugins "$GSM8K_PLUGIN" \
   --reward_funcs gsm8k_accuracy gsm8k_format \
   --columns '{"answer": "solution"}' \
@@ -1510,9 +1510,9 @@ MODES=(baseline invariant)
 SEEDS=(42 43 44)
 
 # baseline (step 0 / 初始模型) 也评一次共享，作为基准
-BASELINE_OUT="$EVAL_DIR/base_qwen3.5-2b.json"
+BASELINE_OUT="$EVAL_DIR/base_qwen3-1.7b.json"
 if [[ ! -f "$BASELINE_OUT" ]]; then
-  bash "$EXP_DIR/eval/eval_gsm8k.sh" "Qwen/Qwen3.5-2B" "$BASELINE_OUT"
+  bash "$EXP_DIR/eval/eval_gsm8k.sh" "Qwen/Qwen3-1.7B" "$BASELINE_OUT"
 fi
 
 for mode in "${MODES[@]}"; do
@@ -1617,8 +1617,8 @@ def load_trainer_state(path: Path) -> List[dict]:
 
 def plot_acc_per_step() -> None:
     fig, ax = plt.subplots(figsize=(8, 5))
-    baseline_init = load_eval_accuracy(EVAL / "base_qwen3.5-2b.json") or 0.0
-    ax.axhline(baseline_init, color="gray", linestyle="--", label=f"Qwen3.5-2B init = {baseline_init:.3f}")
+    baseline_init = load_eval_accuracy(EVAL / "base_qwen3-1.7b.json") or 0.0
+    ax.axhline(baseline_init, color="gray", linestyle="--", label=f"Qwen3-1.7B init = {baseline_init:.3f}")
 
     for mode in MODES:
         for seed in SEEDS:

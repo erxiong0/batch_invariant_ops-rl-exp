@@ -12,9 +12,9 @@ MODES=(baseline invariant)
 SEEDS=(42 43 44)
 
 # baseline (step 0 / 初始模型) 也评一次共享，作为基准
-BASELINE_OUT="$EVAL_DIR/base_qwen3.5-2b.json"
+BASELINE_OUT="$EVAL_DIR/base_qwen3-1.7b.json"
 if [[ ! -f "$BASELINE_OUT" ]]; then
-  bash "$EXP_DIR/eval/eval_gsm8k.sh" "Qwen/Qwen3.5-2B" "$BASELINE_OUT"
+  bash "$EXP_DIR/eval/eval_gsm8k.sh" "Qwen/Qwen3-1.7B" "$BASELINE_OUT"
 fi
 
 for mode in "${MODES[@]}"; do

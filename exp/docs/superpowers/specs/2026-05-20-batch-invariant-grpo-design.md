@@ -1,7 +1,7 @@
 # Batch Invariance × GRPO 对比实验设计
 
 **日期**: 2026-05-20
-**目标**: 在 swift 官方 Qwen3.5-2B GRPO + GSM8K 配方上，验证启用 `batch_invariant_ops` 对 RL 训练的影响——既要验证机制（rollout vs trainer logprob 偏差），也要验证最终指标（GSM8K accuracy），还要验证可复现性。
+**目标**: 在 swift 官方 Qwen3-1.7B GRPO + GSM8K 配方上，验证启用 `batch_invariant_ops` 对 RL 训练的影响——既要验证机制（rollout vs trainer logprob 偏差），也要验证最终指标（GSM8K accuracy），还要验证可复现性。
 
 ## 1. 背景与假设
 
@@ -80,7 +80,7 @@ Thinking Machines 博客 *Defeating Nondeterminism in LLM Inference* 指出：RL
 ### 2.1 配方对齐
 
 完全复用 ms-swift `Qwen3.5 最佳实践` 文档中的 GRPO 命令（[文档链接](https://swift.readthedocs.io/zh-cn/latest/BestPractices/Qwen3_5-Best-Practice.html)），不做任何超参修改：
-- 模型: `Qwen/Qwen3.5-2B`，full fine-tuning，bf16
+- 模型: `Qwen/Qwen3-1.7B`，full fine-tuning，bf16
 - 数据集: `modelscope/gsm8k`
 - Reward: `gsm8k_accuracy` + `gsm8k_format`（来自 `examples/train/grpo/plugin/gsm8k/gsm8k_plugin.py`）
 - 关键超参: `lr=1e-6`, `num_generations=8`, `temperature=1.0`, `epsilon=0.2`, `epsilon_high=0.28`, `scale_rewards none`, `per_device_train_batch_size=4`, `gradient_accumulation=4`
@@ -119,7 +119,7 @@ exp/grpo_batch_invariance/
 │   └── tests/
 │       ├── test_rms_norm_invariance.py    # batch=1 vs batch=8 逐 bit 相等断言
 │       ├── test_sdpa_invariance.py        # 同上
-│       └── test_end_to_end_forward.py     # Qwen3.5-2B 整体 forward 在 batch=1 / 8 / 32 上 bit-equal
+│       └── test_end_to_end_forward.py     # Qwen3-1.7B 整体 forward 在 batch=1 / 8 / 32 上 bit-equal
 ├── launcher.py                    # 零侵入接入 swift 的启动器（见 §4）
 ├── diagnostics/
 │   ├── logprob_mismatch.py        # 核心诊断：4 cell 对比 logprob diff
@@ -169,8 +169,8 @@ cli_main()
 调用方式：
 
 ```bash
-BIM_MODE=invariant python launcher.py rlhf --rlhf_type grpo --model Qwen/Qwen3.5-2B ...
-BIM_MODE=baseline   python launcher.py rlhf --rlhf_type grpo --model Qwen/Qwen3.5-2B ...
+BIM_MODE=invariant python launcher.py rlhf --rlhf_type grpo --model Qwen/Qwen3-1.7B ...
+BIM_MODE=baseline   python launcher.py rlhf --rlhf_type grpo --model Qwen/Qwen3-1.7B ...
 ```
 
 **风险 1 处理**: 如果 colocate 模式下 trainer 侧的 patch 与 vLLM 内部 batch-invariant kernel 冲突（双重 patch），降级方案是把 trainer 侧的两次 `enable_*` 改为 context manager 包裹（在 swift trainer 的 `compute_loss` / 自定义 logprob 计算位置用 `with set_batch_invariant_mode():` + `with extended_batch_invariant():` 嵌套），通过 `external_plugins` 注入。注意：transformers 模块的 monkey-patch（RMSNorm 类替换）无法用 context manager，必须进程级开启——若必须降级到局部包裹，需保留 RMSNorm 替换不变，只把 aten 级 op 替换收成局部。
@@ -180,7 +180,7 @@ BIM_MODE=baseline   python launcher.py rlhf --rlhf_type grpo --model Qwen/Qwen3.
 实验最有信息量的一段，跑训练前先验证机制。**这一步如果都没区别，训练对比就没意义。**
 
 流程：
-1. 加载 Qwen3.5-2B（不训练）
+1. 加载 Qwen3-1.7B（不训练）
 2. 取 GSM8K 前 200 条 prompt
 3. 用 vLLM rollout 一遍（与训练同 sampling 参数），记录每个 token 的 `logprob_rollout`
 4. 同模型 HF forward 一遍 (prompt, completion) 拼接序列，记录 `logprob_train`
@@ -221,13 +221,15 @@ BIM_MODE=baseline   python launcher.py rlhf --rlhf_type grpo --model Qwen/Qwen3.
 |---|---|---|
 | **R1**: 双重 batch-inv patch 冲突 | invariant 组训练崩溃或 logprob 不一致 | trainer 侧改用 `with set_batch_invariant_mode():` 局部包裹（plugin 注入） |
 | **R2**: invariant kernel 拖慢训练 >2× | 50 step 预算超 6h/run | 5-step pilot 测速后，把矩阵缩为 30 step 或砍到 2 seed |
-| **R3**: Qwen3.5-2B 不在 vLLM batch-inv 验证清单 | 诊断脚本 D cell 仍有 delta | 降级到 Qwen3-1.7B（已验证），保持其他配方不变 |
+| **R3**: ~~Qwen3.5-2B 不在 vLLM batch-inv 验证清单~~ → 已触发，已迁移 | 见下注 | 迁移到 Qwen3-1.7B（已验证），保持其他配方不变 |
 | **R4**: vLLM ≥0.17 与 batch_invariant_ops 当前版本不兼容 | env/verify_env.py 报错 | 钉一个 vllm + torch 版本组合（在 setup.sh 中记录） |
 | **R5**: HF forward 重算 logprob 时显存爆 | 8192 max_completion_length × 200 prompt | 诊断脚本里改成微批 16 + grad disabled |
 | **R6**: SDPA patch 与 transformers attention 实现不兼容 | Qwen3.5 的 attention 模块直接调 `F.scaled_dot_product_attention` 还是走自定义路径未知；FlexAttention 在 bf16 + causal mask + 滑窗 (sliding window attention, Qwen3.5 用) 下的支持范围有限 | 先验证 transformers 实际调用栈；若 FlexAttention 不支持 SWA，退化为 SDPA-MATH 后端（慢但 batch-invariant），同时把 5-step pilot 测速作为决策点 |
 | **R7**: RMSNorm patch 未命中 transformers fused 实现 | transformers 可能不调 `aten::rms_norm`，而是自定义 `Qwen2RMSNorm.forward` | 双重保险：既 patch `aten::rms_norm`，也对 transformers 的 `Qwen2RMSNorm` / `Qwen3RMSNorm` 类做 monkey-patch；单元测试用真实模型 forward 而不是裸 `F.rms_norm` 验证 |
 | **R8**: liger-kernel / 其他 fused MLP 路径绕过 `aten::mm` patch | swift 默认是否启用 liger-kernel 需要确认；transformers 自身的 `attn_implementation` 之外，MLP 部分若被 fused 也会绕过 | 训练命令显式 `--use_liger_kernel false`；`verify_env.py` 检测 liger / apex fused MLP / 其他自定义 SwiGLU kernel 是否已加载并 fail-fast；不依赖 transformers 默认值 |
 | **R9**: cell D 的 `mean|Δlogprob| < 1e-6` gate 不可达（精度地板）| vLLM 内部 logprob 在 bf16 路径输出；HF forward 在 `gen_logits.float()` 后做 fp32 log_softmax。两个软件栈（vLLM C++ vs HF Python + Triton）即便都 batch-invariant，**实现差异 + bf16 rounding** 会让逐 token 差异不为 0（bf16 精度地板 ~2⁻⁷ ≈ 8e-3）| 验收时把 D-cell 阈值改为"显著小于 A-cell"（如 `mean|Δ|(D) < mean|Δ|(A) / 10`）而非绝对 bit-equal；同时关注 `frac>1e-3` 的相对下降。`diagnostics/logprob_mismatch.py` 本身不需要修改——它如实测量 gap，但结果解读须考虑此限制 |
+
+**R3 注（2026-05-21 模型迁移）**: 本实验最终在 Qwen3-1.7B 上执行（不在 Qwen3.5-2B 上），因为 Qwen3.5 是混合 attention 模型（3/4 层为 GatedDeltaNet，来自 fla 库的线性 attention 实现），不在 batch_invariant_ops + ops_extension 的 patch 覆盖范围内，Phase 0 的 bit-equality gate 无法在该架构上成立。Qwen3-1.7B 是标准 dense transformer，被 vLLM batch-invariance 官方验证，且已使用 Qwen3RMSNorm（我们现有 patch 已覆盖）。切换保持 swift GRPO 配方其余部分不变，per-run 训练时间因参数量减少而略短。
 
 ## 9. 执行顺序
 
