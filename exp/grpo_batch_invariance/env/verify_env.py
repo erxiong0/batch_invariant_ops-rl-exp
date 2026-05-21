@@ -1,4 +1,7 @@
-"""环境自检：PyTorch/vLLM 版本、GPU 数量、liger-kernel/fused-MLP 不可加载。"""
+"""环境自检：PyTorch + CUDA 可用、GPU 数量、liger-kernel/fused-MLP 不可加载。
+
+注：本实验已经迁移到 HF rollout（不用 vLLM），所以不检查 vllm。
+"""
 import importlib
 import sys
 
@@ -7,18 +10,11 @@ import torch
 
 def check_pytorch():
     major, minor = torch.__version__.split(".")[:2]
-    assert (int(major), int(minor)) >= (2, 9), f"need torch>=2.9, got {torch.__version__}"
+    assert (int(major), int(minor)) >= (2, 6), f"need torch>=2.6, got {torch.__version__}"
     assert torch.cuda.is_available(), "CUDA not available"
     n_gpu = torch.cuda.device_count()
     assert n_gpu >= 4, f"need 4 GPUs, got {n_gpu}"
-    print(f"OK  torch={torch.__version__}  GPUs={n_gpu}")
-
-
-def check_vllm():
-    import vllm
-    parts = vllm.__version__.split(".")
-    assert (int(parts[0]), int(parts[1])) >= (0, 17), f"need vllm>=0.17, got {vllm.__version__}"
-    print(f"OK  vllm={vllm.__version__}")
+    print(f"OK  torch={torch.__version__}  cuda={torch.version.cuda}  GPUs={n_gpu}")
 
 
 def check_batch_invariant_ops():
@@ -42,7 +38,6 @@ def check_no_liger_active():
 
 def main():
     check_pytorch()
-    check_vllm()
     check_batch_invariant_ops()
     check_no_liger_active()
     print("\nAll environment checks passed.")

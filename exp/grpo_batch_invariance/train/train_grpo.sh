@@ -40,12 +40,7 @@ python "$EXP_DIR/launcher.py" rlhf \
   --reward_funcs gsm8k_accuracy gsm8k_format \
   --columns '{"answer": "solution"}' \
   --enable_thinking false \
-  --use_vllm true \
-  --vllm_mode colocate \
-  --vllm_gpu_memory_utilization 0.4 \
-  --vllm_tensor_parallel_size 1 \
-  --vllm_max_model_len 10240 \
-  --sleep_level 1 \
+  --use_vllm false \
   --tuner_type full \
   --torch_dtype bfloat16 \
   --attn_impl sdpa \
@@ -55,8 +50,8 @@ python "$EXP_DIR/launcher.py" rlhf \
   --max_length 2048 \
   --max_completion_length 8192 \
   --num_train_epochs 1 \
-  --per_device_train_batch_size 4 \
-  --gradient_accumulation_steps 4 \
+  --per_device_train_batch_size 2 \
+  --gradient_accumulation_steps 8 \
   --learning_rate 1e-6 \
   --lr_scheduler_type cosine \
   --save_steps 10 \

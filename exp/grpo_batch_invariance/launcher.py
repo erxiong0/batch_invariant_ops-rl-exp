@@ -4,10 +4,9 @@
     BIM_MODE=baseline   python launcher.py rlhf --rlhf_type grpo --model Qwen/Qwen3-1.7B ...
     BIM_MODE=invariant  python launcher.py rlhf --rlhf_type grpo --model Qwen/Qwen3-1.7B ...
 
-invariant 模式同时翻三个开关：
-  1) VLLM_BATCH_INVARIANT=1                       (vLLM rollout 侧)
-  2) batch_invariant_ops.enable_batch_invariant_mode()  (mm/addmm/log_softmax/mean)
-  3) ops_extension.enable_extended_batch_invariant_mode() (RMSNorm + SDPA)
+invariant 模式翻两个开关（vLLM 已不使用，本实验用 HF rollout）：
+  1) batch_invariant_ops.enable_batch_invariant_mode()  (mm/addmm/log_softmax/mean)
+  2) ops_extension.enable_extended_batch_invariant_mode() (RMSNorm + SDPA)
 """
 from __future__ import annotations
 
@@ -20,12 +19,11 @@ def main() -> None:
     assert mode in {"baseline", "invariant"}, f"bad BIM_MODE: {mode}"
 
     if mode == "invariant":
-        os.environ["VLLM_BATCH_INVARIANT"] = "1"
         from batch_invariant_ops import enable_batch_invariant_mode
         enable_batch_invariant_mode()
         from ops_extension import enable_extended_batch_invariant_mode
         enable_extended_batch_invariant_mode()
-        print(f"[launcher] invariant mode ON: VLLM_BATCH_INVARIANT=1, "
+        print(f"[launcher] invariant mode ON: "
               f"mm/addmm/log_softmax/mean patched, RMSNorm + SDPA patched",
               file=sys.stderr, flush=True)
     else:
