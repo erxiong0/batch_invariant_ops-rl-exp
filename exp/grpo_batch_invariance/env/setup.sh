@@ -8,8 +8,8 @@ cd "$REPO_ROOT"
 # batch_invariant_ops 本仓库自身（editable）
 pip install -e .
 
-# ms-swift（GRPO trainer）
-pip install -U "ms-swift>=4.3"
+# ms-swift（GRPO trainer）。4.3+ 是文档版本号，发布版最新为 4.2.x；GRPO 自 3.x 稳定，4.2 即可。
+pip install -U "ms-swift>=4.2"
 
 # vLLM（必须 ≥0.17，自带 batch invariance 支持）
 pip install -U "vllm>=0.17.0"
