@@ -9,7 +9,7 @@ CUDA_VISIBLE_DEVICES=0 swift eval \
   --model "$CKPT" \
   --enable_thinking false \
   --eval_dataset gsm8k \
-  --eval_backend Native --infer_backend vllm \
+  --eval_backend Native --infer_backend pt \
   --eval_generation_config '{"max_tokens":8192,"temperature":0.0,"do_sample":false}' \
   --eval_output_dir "$(dirname "$OUT")" 2>&1 | tee "${OUT}.log"
 

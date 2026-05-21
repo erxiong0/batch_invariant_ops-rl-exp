@@ -1,6 +1,6 @@
-"""Plot logprob mismatch histograms across the 4 cells.
+"""Plot logprob mismatch histograms for 2 cells.
 
-读取 results/diagnostics/cell_{A,B,C,D}.json，输出 figures/logprob_diff_hist.png
+读取 results/diagnostics/cell_{A,B}.json，输出 figures/logprob_diff_hist.png
 """
 from __future__ import annotations
 
@@ -17,14 +17,9 @@ FIG_DIR = EXP_DIR / "results" / "figures"
 
 def main() -> None:
     FIG_DIR.mkdir(parents=True, exist_ok=True)
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=True, sharey=True)
-    titles = {
-        "A": "A: baseline (no patches)",
-        "B": "B: trainer-only invariant",
-        "C": "C: vLLM-only invariant",
-        "D": "D: both invariant",
-    }
-    for ax, cell in zip(axes.flat, "ABCD"):
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharex=True, sharey=True)
+    titles = {"A": "A: baseline (no patches)", "B": "B: invariant (trainer-side patches)"}
+    for ax, cell in zip(axes, ["A", "B"]):
         path = RESULTS / f"cell_{cell}.json"
         data = json.loads(path.read_text())
         deltas = np.array(data["histogram_deltas"])
@@ -33,7 +28,7 @@ def main() -> None:
                      f"frac>1e-3={data['frac_gt_1e-3']:.2%}")
         ax.set_xlabel("logprob_rollout - logprob_train")
         ax.set_ylabel("count (log)")
-    fig.suptitle("Rollout vs Trainer logprob diff — 4-cell control")
+    fig.suptitle("HF rollout vs HF trainer forward — 2-cell control")
     fig.tight_layout()
     out = FIG_DIR / "logprob_diff_hist.png"
     fig.savefig(out, dpi=150)

@@ -1,7 +1,7 @@
 """Aggregate all results into results/summary.md + plots.
 
 输入:
-  results/diagnostics/cell_{A,B,C,D}.json
+  results/diagnostics/cell_{A,B}.json
   results/diagnostics/repeatability_{baseline,invariant}.json
   results/eval/{mode}_seed{seed}_step{k}.json
   results/runs/{mode}_seed{seed}/trainer_state.json (训练曲线)
@@ -100,11 +100,11 @@ def write_summary_md() -> None:
     lines: List[str] = ["# Experiment Summary\n"]
 
     # Diagnostics
-    lines.append("## 1. Logprob mismatch (4-cell diagnostic)\n")
+    lines.append("## 1. Logprob mismatch (2-cell diagnostic)\n")
     lines.append("| cell | config | mean|Δ| | max|Δ| | frac>1e-3 |")
     lines.append("|---|---|---|---|---|")
-    cell_desc = {"A": "baseline", "B": "trainer-only", "C": "vllm-only", "D": "both invariant"}
-    for c in "ABCD":
+    cell_desc = {"A": "baseline", "B": "invariant (trainer-side)"}
+    for c in "AB":
         p = DIAG / f"cell_{c}.json"
         if not p.exists():
             continue
@@ -144,7 +144,7 @@ def write_summary_md() -> None:
     lines.append("")
 
     lines.append("## 4. Figures\n")
-    lines.append("- `figures/logprob_diff_hist.png` — 4-cell logprob diff histograms")
+    lines.append("- `figures/logprob_diff_hist.png` — 2-cell logprob diff histograms")
     lines.append("- `figures/reward_curve.png` — GRPO reward across 6 runs")
     lines.append("- `figures/acc_per_step.png` — GSM8K accuracy per step")
     lines.append("")
