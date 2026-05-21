@@ -1,4 +1,4 @@
-"""End-to-end Qwen3.5-2B forward batch invariance test.
+"""End-to-end Qwen3-1.7B forward batch invariance test.
 
 启用 batch_invariant_ops + ops_extension 后，对相同输入 prompt:
   - batch=1 forward 拿 last-token logits
@@ -16,7 +16,7 @@ from ops_extension import (
 )
 
 
-MODEL_ID = "Qwen/Qwen3.5-2B"  # 若拉不到可改 Qwen/Qwen3-1.7B 同样验证
+MODEL_ID = "Qwen/Qwen3-1.7B"
 
 
 @pytest.fixture(scope="module")

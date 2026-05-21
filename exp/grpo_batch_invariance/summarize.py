@@ -49,8 +49,8 @@ def load_trainer_state(path: Path) -> List[dict]:
 
 def plot_acc_per_step() -> None:
     fig, ax = plt.subplots(figsize=(8, 5))
-    baseline_init = load_eval_accuracy(EVAL / "base_qwen3.5-2b.json") or 0.0
-    ax.axhline(baseline_init, color="gray", linestyle="--", label=f"Qwen3.5-2B init = {baseline_init:.3f}")
+    baseline_init = load_eval_accuracy(EVAL / "base_qwen3-1.7b.json") or 0.0
+    ax.axhline(baseline_init, color="gray", linestyle="--", label=f"Qwen3-1.7B init = {baseline_init:.3f}")
 
     for mode in MODES:
         for seed in SEEDS:

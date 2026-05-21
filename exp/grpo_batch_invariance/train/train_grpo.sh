@@ -35,7 +35,7 @@ export DISABLE_LIGER_KERNEL=1
 
 python "$EXP_DIR/launcher.py" rlhf \
   --rlhf_type grpo \
-  --model Qwen/Qwen3.5-2B \
+  --model Qwen/Qwen3-1.7B \
   --external_plugins "$GSM8K_PLUGIN" \
   --reward_funcs gsm8k_accuracy gsm8k_format \
   --columns '{"answer": "solution"}' \

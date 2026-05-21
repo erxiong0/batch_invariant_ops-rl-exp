@@ -14,7 +14,7 @@ from pathlib import Path
 
 EXP_DIR = Path(__file__).resolve().parents[1]
 RESULTS = EXP_DIR / "results" / "diagnostics"
-MODEL_ID = "Qwen/Qwen3.5-2B"
+MODEL_ID = "Qwen/Qwen3-1.7B"
 N_TRIALS = 200
 PROMPT = ("Generate 30 random numbers between 0 and 1000, comma-separated. "
           "Just numbers, no prose.")

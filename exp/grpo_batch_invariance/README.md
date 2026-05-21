@@ -1,6 +1,6 @@
 # Batch Invariance × GRPO 实验
 
-验证 batch-invariant kernel 对 ms-swift Qwen3.5-2B + GSM8K GRPO 训练的影响。
+验证 batch-invariant kernel 对 ms-swift Qwen3-1.7B + GSM8K GRPO 训练的影响。
 
 详见：
 - Spec: `exp/docs/superpowers/specs/2026-05-20-batch-invariant-grpo-design.md`

@@ -30,7 +30,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 EXP_DIR = Path(__file__).resolve().parents[1]
 RESULTS_DIR = EXP_DIR / "results" / "diagnostics"
 
-MODEL_ID = "Qwen/Qwen3.5-2B"
+MODEL_ID = "Qwen/Qwen3-1.7B"
 N_PROMPTS = 200
 MAX_NEW = 256
 SAMPLING = dict(temperature=1.0, top_p=1.0, top_k=-1, seed=12345)
