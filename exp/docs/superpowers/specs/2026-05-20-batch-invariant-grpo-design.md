@@ -227,6 +227,7 @@ BIM_MODE=baseline   python launcher.py rlhf --rlhf_type grpo --model Qwen/Qwen3.
 | **R6**: SDPA patch 与 transformers attention 实现不兼容 | Qwen3.5 的 attention 模块直接调 `F.scaled_dot_product_attention` 还是走自定义路径未知；FlexAttention 在 bf16 + causal mask + 滑窗 (sliding window attention, Qwen3.5 用) 下的支持范围有限 | 先验证 transformers 实际调用栈；若 FlexAttention 不支持 SWA，退化为 SDPA-MATH 后端（慢但 batch-invariant），同时把 5-step pilot 测速作为决策点 |
 | **R7**: RMSNorm patch 未命中 transformers fused 实现 | transformers 可能不调 `aten::rms_norm`，而是自定义 `Qwen2RMSNorm.forward` | 双重保险：既 patch `aten::rms_norm`，也对 transformers 的 `Qwen2RMSNorm` / `Qwen3RMSNorm` 类做 monkey-patch；单元测试用真实模型 forward 而不是裸 `F.rms_norm` 验证 |
 | **R8**: liger-kernel / 其他 fused MLP 路径绕过 `aten::mm` patch | swift 默认是否启用 liger-kernel 需要确认；transformers 自身的 `attn_implementation` 之外，MLP 部分若被 fused 也会绕过 | 训练命令显式 `--use_liger_kernel false`；`verify_env.py` 检测 liger / apex fused MLP / 其他自定义 SwiGLU kernel 是否已加载并 fail-fast；不依赖 transformers 默认值 |
+| **R9**: cell D 的 `mean|Δlogprob| < 1e-6` gate 不可达（精度地板）| vLLM 内部 logprob 在 bf16 路径输出；HF forward 在 `gen_logits.float()` 后做 fp32 log_softmax。两个软件栈（vLLM C++ vs HF Python + Triton）即便都 batch-invariant，**实现差异 + bf16 rounding** 会让逐 token 差异不为 0（bf16 精度地板 ~2⁻⁷ ≈ 8e-3）| 验收时把 D-cell 阈值改为"显著小于 A-cell"（如 `mean|Δ|(D) < mean|Δ|(A) / 10`）而非绝对 bit-equal；同时关注 `frac>1e-3` 的相对下降。`diagnostics/logprob_mismatch.py` 本身不需要修改——它如实测量 gap，但结果解读须考虑此限制 |
 
 ## 9. 执行顺序
 
