@@ -10,6 +10,18 @@ import triton.language as tl
 __all__ = ["set_batch_invariant_mode", "is_batch_invariant_mode_enabled", "disable_batch_invariant_mode", "enable_batch_invariant_mode"]
 
 
+def _accelerator_type() -> str:
+    """PyTorch 2.9+ has torch.accelerator; older releases need a fallback."""
+    acc = getattr(torch, "accelerator", None)
+    if acc is not None and hasattr(acc, "current_accelerator"):
+        return getattr(acc.current_accelerator(), "type", "cpu")
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return "xpu"
+    return "cpu"
+
+
 def _matmul_launch_metadata(
     grid: Callable[..., Any], kernel: Any, args: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -125,7 +137,7 @@ def get_compute_units():
     for the available accelerator. Assigns the value to NUM_SMS.
     """
     NUM_SMS = None
-    device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
+    device_type = _accelerator_type()
 
     # Use match/case for device-specific logic (Python 3.10+)
     match device_type:
@@ -263,8 +275,8 @@ def _log_softmax_kernel(
         exp_vals = tl.exp(vals - max_val)
         sum_exp += tl.sum(tl.where(mask, exp_vals, 0.0))
 
-    # Compute log(sum_exp)
-    log_sum_exp = tl.log(sum_exp)
+    # Compute log(sum_exp); epsilon avoids log(0) on degenerate rows
+    log_sum_exp = tl.log(sum_exp + 1e-20)
 
     # Step 3: Compute final log_softmax values: x - max_val - log_sum_exp
     for col_offset in range(0, n_cols, BLOCK_SIZE):
@@ -470,7 +482,14 @@ def addmm_batch_invariant(bias, a, b):
 
 def _log_softmax_batch_invariant(input, dim, _half_to_float):
     assert not _half_to_float, "not implemented"
-    return log_softmax(input, dim=dim)
+    out = log_softmax(input, dim=dim)
+    # -inf in output is legitimate (e.g., positions masked with -inf in attention scores).
+    # Only fall back if we see NaN, which signals a degenerate row (e.g., all -inf input).
+    # The fallback routes through aten::_softmax (NOT patched) + log to avoid recursing
+    # back into this function via aten::_log_softmax.
+    if torch.isnan(out).any():
+        return torch.softmax(input, dim=dim).log()
+    return out
 
 
 def mean_batch_invariant(input, dim, keepdim=False, dtype: torch.dtype | None = None):
@@ -501,7 +520,7 @@ def enable_batch_invariant_mode():
     global _batch_invariant_MODE, _batch_invariant_LIB
     if _batch_invariant_MODE:
         return
-    dispatch_key = getattr(torch.accelerator.current_accelerator(), "type", "cpu").upper()
+    dispatch_key = _accelerator_type().upper()
     _batch_invariant_MODE = True
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
     _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)
