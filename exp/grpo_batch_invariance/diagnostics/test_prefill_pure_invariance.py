@@ -27,8 +27,8 @@ MODEL_ID = "Qwen/Qwen3-1.7B"
 
 
 def run_prefill_and_capture(model, tok, seq_len: int):
-    """跑一次 prefill on input[:seq_len]，返回 dict[layer_idx] = (input_hidden, attn_output)
-    两个都是 (1, seq_len, H) shape。"""
+    """跑一次 prefill on input[:seq_len]，返回 dict[layer_idx] = (input_hidden, attn_output, attn_mask)
+    """
     prompt = "You are a helpful math assistant.\n\nQuestion: What is 13 * 47?\nAnswer:"
     enc = tok(prompt, return_tensors="pt").to("cuda").input_ids
     if enc.shape[1] >= seq_len:
@@ -44,7 +44,11 @@ def run_prefill_and_capture(model, tok, seq_len: int):
     def make_pre_hook(idx):
         def pre_hook(module, args, kwargs):
             hidden = kwargs.get("hidden_states", args[0] if args else None)
+            attn_mask = kwargs.get("attention_mask", None)
             captures.setdefault(idx, {})["input"] = hidden.detach().clone()
+            captures.setdefault(idx, {})["attn_mask"] = (
+                None if attn_mask is None else attn_mask.detach().clone()
+            )
         return pre_hook
 
     def make_post_hook(idx):
@@ -86,12 +90,18 @@ def main():
     print(f"\n=== Running pure prefill Lq=48 ===")
     cap_48 = run_prefill_and_capture(model, tok, 48)
 
+    print(f"\n=== Layer 0 attention_mask comparison ===")
+    m47 = cap_47[0].get("attn_mask")
+    m48 = cap_48[0].get("attn_mask")
+    print(f"  47-prefill layer 0 mask: {None if m47 is None else f'shape={tuple(m47.shape)} dtype={m47.dtype}'}")
+    print(f"  48-prefill layer 0 mask: {None if m48 is None else f'shape={tuple(m48.shape)} dtype={m48.dtype}'}")
+
     print(f"\n=== Layer-by-layer max diff over rows 0..46 (overlap) ===")
-    print(f"  {'layer':>5} {'input_hidden':>15} {'input_argmax_row':>20} "
-          f"{'attn_output':>15} {'attn_argmax_row':>20}")
+    print(f"  {'layer':>5} {'input_hidden':>15} {'in_argmax':>10} "
+          f"{'attn_output':>15} {'ao_argmax':>10} {'mask_47_shape':>18} {'mask_48_shape':>18}")
     for i in sorted(cap_47.keys()):
-        ih_47 = cap_47[i]["input"][:, :47, :]   # (1, 47, H)
-        ih_48 = cap_48[i]["input"][:, :47, :]   # (1, 47, H)  overlap
+        ih_47 = cap_47[i]["input"][:, :47, :]
+        ih_48 = cap_48[i]["input"][:, :47, :]
         ih_diff_per_row = (ih_47 - ih_48).abs().reshape(-1, 47, ih_47.shape[-1]).amax(dim=(0, 2))
         ih_max = ih_diff_per_row.max().item()
         ih_argmax = int(ih_diff_per_row.argmax().item()) if ih_max > 0 else -1
@@ -102,8 +112,13 @@ def main():
         ao_max = ao_diff_per_row.max().item()
         ao_argmax = int(ao_diff_per_row.argmax().item()) if ao_max > 0 else -1
 
-        print(f"  {i:>5} {ih_max:>15.3e} {f'row={ih_argmax}':>20} "
-              f"{ao_max:>15.3e} {f'row={ao_argmax}':>20}")
+        m47i = cap_47[i].get("attn_mask")
+        m48i = cap_48[i].get("attn_mask")
+        m47s = "None" if m47i is None else f"{tuple(m47i.shape)}"
+        m48s = "None" if m48i is None else f"{tuple(m48i.shape)}"
+
+        print(f"  {i:>5} {ih_max:>15.3e} {f'row={ih_argmax}':>10} "
+              f"{ao_max:>15.3e} {f'row={ao_argmax}':>10} {m47s:>18} {m48s:>18}")
 
 
 if __name__ == "__main__":
