@@ -5,6 +5,12 @@ set -euo pipefail
 #   BIM_MODE=baseline  SEED=42 bash exp/grpo_batch_invariance/train/train_grpo.sh
 #   BIM_MODE=invariant SEED=42 bash exp/grpo_batch_invariance/train/train_grpo.sh
 #
+# Optional env overrides (并跑/做对照时用):
+#   CUDA_VISIBLE_DEVICES=4,5,6,7    指定显卡（默认 0,1,2,3）
+#   NPROC_PER_NODE=4                 worker 数（默认 4；需匹配 CUDA_VISIBLE_DEVICES 数量）
+#   RUN_TAG=sdpa                     给 output_dir 加后缀
+#                                    (results/runs/<BIM_MODE>_seed<SEED>_<TAG>/)
+#
 # 要求当前工作目录为仓库根（含 batch_invariant_ops/）。
 
 : "${BIM_MODE:?need BIM_MODE=baseline|invariant}"
@@ -12,7 +18,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 EXP_DIR="$REPO_ROOT/exp/grpo_batch_invariance"
-OUTPUT_DIR="$EXP_DIR/results/runs/${BIM_MODE}_seed${SEED}"
+RUN_NAME="${BIM_MODE}_seed${SEED}${RUN_TAG:+_${RUN_TAG}}"
+OUTPUT_DIR="$EXP_DIR/results/runs/${RUN_NAME}"
 mkdir -p "$OUTPUT_DIR"
 
 # 默认走我们自带的 bim_gsm8k_plugin.py —— 它在 worker import 时跑 BIM_MODE invariant 初始化
@@ -30,11 +37,12 @@ SYSTEM_PROMPT='You are a helpful math assistant. Solve the problem step by step 
 
 cd "$REPO_ROOT"
 export PYTHONPATH="${EXP_DIR}:${REPO_ROOT}:${PYTHONPATH:-}"
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-export NPROC_PER_NODE=4
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+export NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 export BIM_MODE
 # 关闭 fused MLP 路径（spec §1.3）
 export DISABLE_LIGER_KERNEL=1
+echo "[train_grpo] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES NPROC_PER_NODE=$NPROC_PER_NODE OUTPUT_DIR=$OUTPUT_DIR" >&2
 
 python "$EXP_DIR/launcher.py" rlhf \
   --rlhf_type grpo \
