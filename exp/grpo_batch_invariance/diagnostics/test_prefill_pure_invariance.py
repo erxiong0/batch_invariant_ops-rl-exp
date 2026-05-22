@@ -157,36 +157,43 @@ def main():
               f"{q_argmx:>8d} {k_argmx:>8d} {ao_argmx:>8d}")
 
     # --- Decisive isolated reproducer at layer 4 ---
-    # 拿 48-prefill 的 Q/K/V/scaling，slice 出 47 vs 48 长度，调 sdpa_batch_invariant,
-    # 比较 row 27。如果 diff > 0 → minimal reproducer 拿到了。
     from ops_extension.sdpa import sdpa_batch_invariant
+    from transformers.integrations.sdpa_attention import repeat_kv
     leak_layer = 4
-    Q_full = cap_48[leak_layer]["Q_post_rotary"]   # (1, H_q, 48, D)
-    K_full = cap_48[leak_layer]["K_post_rotary"]   # (1, H_kv, 48, D)
-    V_full = cap_48[leak_layer]["V_post_proj"]
+    Q_full = cap_48[leak_layer]["Q_post_rotary"]   # (1, H_q=16, 48, D)
+    K_full = cap_48[leak_layer]["K_post_rotary"]   # (1, H_kv=8, 48, D)
+    V_full = cap_48[leak_layer]["V_post_proj"]     # (1, H_kv=8, 48, D)
+
+    # 展开 GQA：K/V 复制到 H_q 头数
+    n_rep = Q_full.shape[1] // K_full.shape[1]
+    K_full = repeat_kv(K_full, n_rep)
+    V_full = repeat_kv(V_full, n_rep)
+
     print(f"\n=== Isolated reproducer with REAL captured Q/K/V at layer {leak_layer} ===")
-    print(f"  Q shape: {tuple(Q_full.shape)}, K shape: {tuple(K_full.shape)}, V shape: {tuple(V_full.shape)}")
+    print(f"  Q shape: {tuple(Q_full.shape)}, K/V (post repeat_kv): {tuple(K_full.shape)}")
     with torch.no_grad():
-        # 用真实 Q/K/V (48-prefill 的值) 调 sdpa_batch_invariant，分别按 47 和 48 长度切
         out_47 = sdpa_batch_invariant(
-            Q_full[:, :, :47, :], K_full[:, :, :47, :], V_full[:, :, :47, :], is_causal=True,
+            Q_full[:, :, :47, :].contiguous(),
+            K_full[:, :, :47, :].contiguous(),
+            V_full[:, :, :47, :].contiguous(),
+            is_causal=True,
         )
         out_48 = sdpa_batch_invariant(
-            Q_full, K_full, V_full, is_causal=True,
+            Q_full.contiguous(), K_full.contiguous(), V_full.contiguous(),
+            is_causal=True,
         )
     diff_per_row = (out_47 - out_48[:, :, :47, :]).abs().reshape(-1, 47, out_47.shape[-1]).amax(dim=(0, 2))
     isolated_max = diff_per_row.max().item()
     isolated_argmax = int(diff_per_row.argmax().item()) if isolated_max > 0 else -1
     print(f"  isolated diff: max={isolated_max:.3e} at row={isolated_argmax}")
-    if isolated_max == 0.0:
-        # 真实输入下也是 invariant => attention compute 不背锅，那 V 可能在两次 prefill 不一致
-        v_47 = cap_47[leak_layer]["V_post_proj"][:, :, :47, :]
-        v_48 = cap_48[leak_layer]["V_post_proj"][:, :, :47, :]
-        v_diff_per_row = (v_47 - v_48).abs().reshape(-1, 47, v_47.shape[-1]).amax(dim=(0, 2))
-        v_max = v_diff_per_row.max().item()
-        v_argmax = int(v_diff_per_row.argmax().item()) if v_max > 0 else -1
-        print(f"\n  → isolated invariant; check V_post_proj diff between prefills: "
-              f"max={v_max:.3e} at row={v_argmax}")
+
+    # 同时核对 V 在两次 prefill 是否一致（应该都是 0 diff）
+    v_47 = cap_47[leak_layer]["V_post_proj"][:, :, :47, :]
+    v_48 = cap_48[leak_layer]["V_post_proj"][:, :, :47, :]
+    v_diff_per_row = (v_47 - v_48).abs().reshape(-1, 47, v_47.shape[-1]).amax(dim=(0, 2))
+    v_max = v_diff_per_row.max().item()
+    v_argmax = int(v_diff_per_row.argmax().item()) if v_max > 0 else -1
+    print(f"  V_post_proj diff between prefills: max={v_max:.3e} at row={v_argmax}")
 
 
 if __name__ == "__main__":
