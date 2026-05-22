@@ -8,6 +8,7 @@ set -euo pipefail
 # Optional env overrides (并跑/做对照时用):
 #   CUDA_VISIBLE_DEVICES=4,5,6,7    指定显卡（默认 0,1,2,3）
 #   NPROC_PER_NODE=4                 worker 数（默认 4；需匹配 CUDA_VISIBLE_DEVICES 数量）
+#   MASTER_PORT=29501                同节点并跑时**必填**（torchrun 默认 29500 会撞车）
 #   RUN_TAG=sdpa                     给 output_dir 加后缀
 #                                    (results/runs/<BIM_MODE>_seed<SEED>_<TAG>/)
 #
