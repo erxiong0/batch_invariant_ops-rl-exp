@@ -5,11 +5,18 @@ Q @ K^T -> softmax -> @ V 三步，让 @ 走 batch_invariant_ops 已经
 patched 的 aten::mm，softmax 走 aten::_log_softmax 的反向（exp 后归一化）。
 
 trainer 侧足够快（forward only，~2× FA2 慢但可接受）。
+
+注意 patch 路径：只 monkey-patch `F.scaled_dot_product_attention` 是不够的。
+transformers/integrations/sdpa_attention.py 在 module load 时做了
+`from torch.nn.functional import scaled_dot_product_attention`，把原函数固定
+绑到了自己命名空间。之后改 F.xxx 摸不到它。所以 patch_sdpa() 在替换 F. 之外
+还要遍历 sys.modules，把所有 import 过原函数的模块的绑定一并替换。
 """
 from __future__ import annotations
 
 import math
-from typing import Optional
+import sys
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -65,22 +72,65 @@ def sdpa_batch_invariant(
 
 _PATCHED = False
 _ORIGINAL_SDPA = None
+# Each item: (module_name, attr_name, original_value). 用来 unpatch 时还原。
+_PATCHED_BINDINGS: List[Tuple[str, str, object]] = []
 
 
-def patch_sdpa() -> None:
-    """Monkey-patch torch.nn.functional.scaled_dot_product_attention."""
-    global _PATCHED, _ORIGINAL_SDPA
+def _rebind_in_sys_modules(original, replacement) -> List[Tuple[str, str, object]]:
+    """遍历 sys.modules，把所有 module 命名空间里指向 `original` 的属性替换为
+    `replacement`。返回被替换的 (module_name, attr_name, original) 三元组。
+    """
+    rebound: List[Tuple[str, str, object]] = []
+    for mod_name, mod in list(sys.modules.items()):
+        if mod is None:
+            continue
+        # 常见名字：直接 import 的写法 `from torch.nn.functional import scaled_dot_product_attention`
+        # 别名写法：`from torch.nn.functional import scaled_dot_product_attention as sdpa`
+        # 我们只匹配 identity（is 比较），所以别名也会被命中。
+        try:
+            mod_vars = vars(mod)
+        except TypeError:
+            continue
+        for attr_name, attr in list(mod_vars.items()):
+            if attr is original:
+                try:
+                    setattr(mod, attr_name, replacement)
+                    rebound.append((mod_name, attr_name, original))
+                except (AttributeError, TypeError):
+                    pass
+    return rebound
+
+
+def patch_sdpa(verbose: bool = True) -> None:
+    """Monkey-patch torch.nn.functional.scaled_dot_product_attention 并覆盖所有
+    已经 import 它的模块命名空间。"""
+    global _PATCHED, _ORIGINAL_SDPA, _PATCHED_BINDINGS
     if _PATCHED:
         return
     _ORIGINAL_SDPA = F.scaled_dot_product_attention
     F.scaled_dot_product_attention = sdpa_batch_invariant
+    _PATCHED_BINDINGS = _rebind_in_sys_modules(_ORIGINAL_SDPA, sdpa_batch_invariant)
     _PATCHED = True
+    if verbose:
+        binding_summary = ", ".join(f"{m}.{a}" for m, a, _ in _PATCHED_BINDINGS) or "<none>"
+        print(f"[ops_extension.sdpa] patched F.scaled_dot_product_attention + "
+              f"{len(_PATCHED_BINDINGS)} sys.modules bindings: {binding_summary}",
+              file=sys.stderr, flush=True)
 
 
 def unpatch_sdpa() -> None:
-    global _PATCHED, _ORIGINAL_SDPA
+    global _PATCHED, _ORIGINAL_SDPA, _PATCHED_BINDINGS
     if not _PATCHED:
         return
     F.scaled_dot_product_attention = _ORIGINAL_SDPA
+    for mod_name, attr_name, original in _PATCHED_BINDINGS:
+        mod = sys.modules.get(mod_name)
+        if mod is None:
+            continue
+        try:
+            setattr(mod, attr_name, original)
+        except (AttributeError, TypeError):
+            pass
+    _PATCHED_BINDINGS = []
     _ORIGINAL_SDPA = None
     _PATCHED = False
