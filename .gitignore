@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# Local-only experiment design docs (kept on disk, not tracked)
+exp/docs/
+exp/.claude/
+
+# Common artifacts
+*.png
+!batch-invariant.png
+.DS_Store
