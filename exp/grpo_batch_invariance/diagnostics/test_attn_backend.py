@@ -92,6 +92,15 @@ def run(attn_impl: str):
     print(f"  fraction of positions with diff:   {sum(1 for d in diffs if d > 0)}/{N_TOKENS}")
     print(f"  max diff:                          {max(diffs):.3e}")
 
+    # 暴露 wrapper 调用次数 —— 若 count==0 说明 dispatch 没经过我们；
+    # 若 count==1 说明只第一次 prefill 经过、后续 decode + per_step 都旁路了；
+    # 若 count >> 1 说明每次 attention 都走 wrapper，diff 的根因不在 dispatch 而在 wrapper 内部
+    try:
+        from ops_extension.sdpa import _INVARIANT_CALL_COUNT
+        print(f"  [count] _sdpa_attention_forward_invariant total calls: {_INVARIANT_CALL_COUNT[0]}")
+    except ImportError:
+        pass
+
     del model
     torch.cuda.empty_cache()
 
