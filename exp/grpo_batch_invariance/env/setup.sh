@@ -19,13 +19,17 @@ pip install -e .
 # 3) ms-swift（GRPO trainer）：4.2.x 兼容 torch 2.6
 pip install -U "ms-swift>=4.2,<4.3"
 
-# 4) transformers：与 swift 4.2.x 兼容的范围；不再钉 5.2（5.2 要 torch≥2.9）
+# 4) deepspeed：train_grpo.sh 用 --deepspeed zero2，没装会在 SftArguments._init_deepspeed 报
+#    PackageNotFoundError。0.14–0.15 跟 torch 2.6 + swift 4.2 兼容。
+pip install "deepspeed>=0.14,<0.16"
+
+# 5) transformers：与 swift 4.2.x 兼容的范围；不再钉 5.2（5.2 要 torch≥2.9）
 pip install -U "transformers>=4.46,<4.55"
 
-# 5) 评测依赖
+# 6) 评测依赖
 pip install "math_verify==0.5.2"
 
-# 6) 测试 + 绘图
+# 7) 测试 + 绘图
 pip install pytest matplotlib
 
 echo ""
