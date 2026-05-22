@@ -43,7 +43,7 @@ python "$EXP_DIR/launcher.py" rlhf \
   --use_vllm false \
   --tuner_type full \
   --torch_dtype bfloat16 \
-  --attn_impl sdpa \
+  --attn_impl eager \
   --use_liger_kernel false \
   --dataset 'modelscope/gsm8k' \
   --load_from_cache_file true \
