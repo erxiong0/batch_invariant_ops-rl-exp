@@ -120,25 +120,25 @@ def _sdpa_attention_forward_invariant(
     _INVARIANT_CALL_COUNT[0] += 1
     if _INVARIANT_CALL_COUNT[0] == 1:
         print(f"[ops_extension.sdpa] _sdpa_attention_forward_invariant CALLED for the first time "
-              f"(module={type(module).__name__})", file=sys.stderr, flush=True)
-    sdpa_kwargs = {}
-    if hasattr(module, "num_key_value_groups"):
+              f"(module={type(module).__name__}, Q={tuple(query.shape)}, K={tuple(key.shape)})",
+              file=sys.stderr, flush=True)
+
+    # 强制走 repeat_kv 路径，跟 transformers eager_attention_forward 完全一致。
+    # 不用 enable_gqa 旁路 —— 我们的 sdpa_batch_invariant 内部 repeat_interleave 跟
+    # repeat_kv 在 stride/layout 上不同，可能让下游 matmul 落到不同的 invariant tile，
+    # 引入 16-aligned 数值漂移。eager 用 repeat_kv 给出 0 diff，所以镜像它最稳。
+    if hasattr(module, "num_key_value_groups") and module.num_key_value_groups > 1:
         try:
-            from transformers.integrations.sdpa_attention import (
-                repeat_kv,
-                use_gqa_in_sdpa,
-            )
-            if not use_gqa_in_sdpa(attention_mask, key):
-                key = repeat_kv(key, module.num_key_value_groups)
-                value = repeat_kv(value, module.num_key_value_groups)
-            else:
-                sdpa_kwargs = {"enable_gqa": True}
+            from transformers.integrations.sdpa_attention import repeat_kv
+            key = repeat_kv(key, module.num_key_value_groups)
+            value = repeat_kv(value, module.num_key_value_groups)
         except ImportError:
-            # transformers 没装或 API 变了，退化到全展开
-            n_rep = query.shape[-3] // key.shape[-3] if key.shape[-3] != query.shape[-3] else 1
-            if n_rep > 1:
-                key = key.repeat_interleave(n_rep, dim=-3)
-                value = value.repeat_interleave(n_rep, dim=-3)
+            # transformers 缺这个 helper 时降级；正常路径不应该走到。
+            n_rep = module.num_key_value_groups
+            B, H_kv, S, D = key.shape
+            key = key[:, :, None, :, :].expand(B, H_kv, n_rep, S, D).reshape(B, H_kv * n_rep, S, D)
+            B, H_kv, S, D = value.shape
+            value = value[:, :, None, :, :].expand(B, H_kv, n_rep, S, D).reshape(B, H_kv * n_rep, S, D)
 
     if attention_mask is not None and attention_mask.ndim == 4:
         attention_mask = attention_mask[:, :, :, : key.shape[-2]]
@@ -156,13 +156,13 @@ def _sdpa_attention_forward_invariant(
     if isinstance(is_causal, torch.Tensor):
         is_causal = bool(is_causal.item())
 
+    # K/V 已经 repeat_kv 展开成跟 Q 同 head 数；不再传 enable_gqa。
     attn_output = sdpa_batch_invariant(
         query, key, value,
         attn_mask=attention_mask,
         dropout_p=dropout,
         scale=scaling,
         is_causal=is_causal,
-        **sdpa_kwargs,
     )
     attn_output = attn_output.transpose(1, 2).contiguous()
     return attn_output, None
