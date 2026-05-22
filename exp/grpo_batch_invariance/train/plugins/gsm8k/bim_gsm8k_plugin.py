@@ -47,37 +47,68 @@ def _enable_invariant_mode_if_requested() -> None:
           file=sys.stderr, flush=True)
 
 
-def _patch_trl_grpo_grad_accum() -> None:
-    """trl >= 0.26 GRPOTrainer.training_step reads self.current_gradient_accumulation_steps,
-    but swift 4.2.1's GRPOTrainer subclass construction chain never sets it. Backfill
-    lazily in training_step before delegating to the original implementation.
+def _backfill_grad_accum(trainer) -> None:
+    if not hasattr(trainer, "current_gradient_accumulation_steps"):
+        gas = getattr(getattr(trainer, "args", None), "gradient_accumulation_steps", 1)
+        trainer.current_gradient_accumulation_steps = gas
+
+
+def _patch_grpo_training_step() -> None:
+    """Patch BOTH trl.GRPOTrainer AND swift.rlhf_trainers.grpo_trainer.GRPOTrainer.
+
+    trl >= 0.26 reads self.current_gradient_accumulation_steps in training_step,
+    but swift 4.2.1's subclass construction never sets it. We wrap training_step
+    on both layers — whichever one MRO actually hits will backfill the attr
+    before delegating downward.
     """
+    patched_any = False
+
+    # Layer 1: swift's subclass — this is the immediate super() target from the
+    # transformers Trainer loop, so this is where the call lands first.
+    try:
+        from swift.rlhf_trainers.grpo_trainer import GRPOTrainer as SwiftGRPOTrainer
+        _orig = SwiftGRPOTrainer.training_step
+        if not getattr(_orig, "_bim_patched", False):
+            def _swift_wrapped(self, *args, **kwargs):
+                _backfill_grad_accum(self)
+                return _orig(self, *args, **kwargs)
+            _swift_wrapped._bim_patched = True  # type: ignore[attr-defined]
+            SwiftGRPOTrainer.training_step = _swift_wrapped
+            print(f"[bim_plugin] patched swift.GRPOTrainer.training_step on pid={os.getpid()}",
+                  file=sys.stderr, flush=True)
+            patched_any = True
+    except Exception as e:
+        print(f"[bim_plugin] WARN: swift GRPOTrainer patch skipped: {e}",
+              file=sys.stderr, flush=True)
+
+    # Layer 2: trl base — defense if swift ever calls trl.training_step directly
+    # (e.g. via super().training_step from another mixin layer we don't see).
     try:
         from trl import GRPOTrainer as TrlGRPOTrainer
+        _orig = TrlGRPOTrainer.training_step
+        if not getattr(_orig, "_bim_patched", False):
+            def _trl_wrapped(self, *args, **kwargs):
+                _backfill_grad_accum(self)
+                return _orig(self, *args, **kwargs)
+            _trl_wrapped._bim_patched = True  # type: ignore[attr-defined]
+            TrlGRPOTrainer.training_step = _trl_wrapped
+            print(f"[bim_plugin] patched trl.GRPOTrainer.training_step on pid={os.getpid()}",
+                  file=sys.stderr, flush=True)
+            patched_any = True
     except Exception as e:
-        print(f"[bim_plugin] WARN: trl patch skipped: {e}", file=sys.stderr)
-        return
-    _orig_step = TrlGRPOTrainer.training_step
-    if getattr(_orig_step, "_bim_patched", False):
-        return  # idempotent across re-imports
-    _notice = {"emitted": False}
+        print(f"[bim_plugin] WARN: trl GRPOTrainer patch skipped: {e}",
+              file=sys.stderr, flush=True)
 
-    def _wrapped_step(self, *args, **kwargs):
-        if not hasattr(self, "current_gradient_accumulation_steps"):
-            gas = getattr(getattr(self, "args", None), "gradient_accumulation_steps", 1)
-            self.current_gradient_accumulation_steps = gas
-            if not _notice["emitted"]:
-                print(f"[bim_plugin] backfilled current_gradient_accumulation_steps={gas} "
-                      f"on pid={os.getpid()}", file=sys.stderr, flush=True)
-                _notice["emitted"] = True
-        return _orig_step(self, *args, **kwargs)
-
-    _wrapped_step._bim_patched = True  # type: ignore[attr-defined]
-    TrlGRPOTrainer.training_step = _wrapped_step
+    if not patched_any:
+        print(f"[bim_plugin] WARN: no GRPOTrainer class found to patch on pid={os.getpid()}",
+              file=sys.stderr, flush=True)
 
 
-# Fire both at import time, before swift loads any trainer class.
-_patch_trl_grpo_grad_accum()
+# Fire both at import time. Print a banner first so a missing prefix in logs
+# immediately tells us the plugin wasn't loaded vs loaded-but-patch-skipped.
+print(f"[bim_plugin] loaded by pid={os.getpid()} (BIM_MODE={os.environ.get('BIM_MODE', 'baseline')})",
+      file=sys.stderr, flush=True)
+_patch_grpo_training_step()
 _enable_invariant_mode_if_requested()
 
 
