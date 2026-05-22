@@ -68,6 +68,7 @@ def run_prefill_and_capture(model, tok, seq_len: int):
         counter["v"] += 1
         captures.setdefault(idx, {})["Q_post_rotary"] = query.detach().clone()
         captures.setdefault(idx, {})["K_post_rotary"] = key.detach().clone()
+        captures.setdefault(idx, {})["V_post_proj"] = value.detach().clone()
         return orig(module, query, key, value, attention_mask, **kw)
 
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
@@ -154,6 +155,38 @@ def main():
 
         print(f"  {i:>5} {ih_max:>10.2e} {q_max:>10.2e} {k_max:>10.2e} {ao_max:>10.2e} "
               f"{q_argmx:>8d} {k_argmx:>8d} {ao_argmx:>8d}")
+
+    # --- Decisive isolated reproducer at layer 4 ---
+    # 拿 48-prefill 的 Q/K/V/scaling，slice 出 47 vs 48 长度，调 sdpa_batch_invariant,
+    # 比较 row 27。如果 diff > 0 → minimal reproducer 拿到了。
+    from ops_extension.sdpa import sdpa_batch_invariant
+    leak_layer = 4
+    Q_full = cap_48[leak_layer]["Q_post_rotary"]   # (1, H_q, 48, D)
+    K_full = cap_48[leak_layer]["K_post_rotary"]   # (1, H_kv, 48, D)
+    V_full = cap_48[leak_layer]["V_post_proj"]
+    print(f"\n=== Isolated reproducer with REAL captured Q/K/V at layer {leak_layer} ===")
+    print(f"  Q shape: {tuple(Q_full.shape)}, K shape: {tuple(K_full.shape)}, V shape: {tuple(V_full.shape)}")
+    with torch.no_grad():
+        # 用真实 Q/K/V (48-prefill 的值) 调 sdpa_batch_invariant，分别按 47 和 48 长度切
+        out_47 = sdpa_batch_invariant(
+            Q_full[:, :, :47, :], K_full[:, :, :47, :], V_full[:, :, :47, :], is_causal=True,
+        )
+        out_48 = sdpa_batch_invariant(
+            Q_full, K_full, V_full, is_causal=True,
+        )
+    diff_per_row = (out_47 - out_48[:, :, :47, :]).abs().reshape(-1, 47, out_47.shape[-1]).amax(dim=(0, 2))
+    isolated_max = diff_per_row.max().item()
+    isolated_argmax = int(diff_per_row.argmax().item()) if isolated_max > 0 else -1
+    print(f"  isolated diff: max={isolated_max:.3e} at row={isolated_argmax}")
+    if isolated_max == 0.0:
+        # 真实输入下也是 invariant => attention compute 不背锅，那 V 可能在两次 prefill 不一致
+        v_47 = cap_47[leak_layer]["V_post_proj"][:, :, :47, :]
+        v_48 = cap_48[leak_layer]["V_post_proj"][:, :, :47, :]
+        v_diff_per_row = (v_47 - v_48).abs().reshape(-1, 47, v_47.shape[-1]).amax(dim=(0, 2))
+        v_max = v_diff_per_row.max().item()
+        v_argmax = int(v_diff_per_row.argmax().item()) if v_max > 0 else -1
+        print(f"\n  → isolated invariant; check V_post_proj diff between prefills: "
+              f"max={v_max:.3e} at row={v_argmax}")
 
 
 if __name__ == "__main__":
