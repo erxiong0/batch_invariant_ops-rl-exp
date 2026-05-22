@@ -483,6 +483,25 @@ def addmm_batch_invariant(bias, a, b):
     return matmul_persistent(a, b, bias=bias)
 
 
+def bmm_batch_invariant(a, b):
+    """Batch-invariant bmm via per-slice 2D matmul using the patched matmul_persistent.
+
+    aten::bmm is what `torch.matmul` on 4D tensors collapses to (after flattening
+    leading dims), so attention's Q@K^T / P@V both reach here. cuBLAS bmm chooses
+    Split-K / tile-shape based on the batch dimension, which breaks batch
+    invariance. Routing per-batch through matmul_persistent (a 2D persistent
+    Triton kernel with fixed reduction order) restores invariance.
+
+    Cost: Python loop over the batch dimension. For attention with B*H typically
+    in the low hundreds this is ~100× slower than cuBLAS bmm, acceptable for
+    trainer-side correctness validation; the rollout side is the same path.
+    """
+    assert a.dim() == 3 and b.dim() == 3, f"bmm needs 3D inputs, got {a.shape} {b.shape}"
+    B = a.shape[0]
+    outs = [matmul_persistent(a[i], b[i]) for i in range(B)]
+    return torch.stack(outs, dim=0)
+
+
 def _log_softmax_batch_invariant(input, dim, _half_to_float):
     assert not _half_to_float, "not implemented"
     out = log_softmax(input, dim=dim)
@@ -528,6 +547,7 @@ def enable_batch_invariant_mode():
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
     _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)
     _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, dispatch_key )
+    _batch_invariant_LIB.impl("aten::bmm", bmm_batch_invariant, dispatch_key )
     _batch_invariant_LIB.impl("aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key )
     _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key )
 
