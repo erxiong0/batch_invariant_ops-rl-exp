@@ -51,17 +51,22 @@ def sdpa_batch_invariant(
     # (B, H, Lq, Lk)
     scores = torch.matmul(query, key.transpose(-2, -1)) * scale
 
+    # 用大负数而非 -inf 填 mask，避免 "整行全 masked" 时 softmax 出 NaN（rollout 阶段
+     # left-padded batch generation 会触发此场景：PAD query 在 causal mask 下对所有 key
+    # 都不可见）。对正常行的 softmax 数值影响低于 fp32 eps，bit-exact 不变性不受影响。
+    NEG_LARGE = -1.0e9
+
     if is_causal:
         Lq, Lk = query.shape[-2], key.shape[-2]
-        # mask[i, j] = True 表示需要屏蔽（j > i + (Lk - Lq)）
         causal = torch.ones(Lq, Lk, device=query.device, dtype=torch.bool).triu(diagonal=Lk - Lq + 1)
-        scores = scores.masked_fill(causal, float("-inf"))
+        scores = scores.masked_fill(causal, NEG_LARGE)
 
     if attn_mask is not None:
         if attn_mask.dtype == torch.bool:
-            scores = scores.masked_fill(~attn_mask, float("-inf"))
+            scores = scores.masked_fill(~attn_mask, NEG_LARGE)
         else:
-            scores = scores + attn_mask
+            # additive mask 已经携带 -inf 或 0；为了避免 -inf 触发 NaN 路径，clamp 一下下限
+            scores = scores + attn_mask.clamp(min=NEG_LARGE)
 
     # 历史注释说 aten::_log_softmax 被 patch、_softmax 没有，所以原来选 log_softmax + exp。
     # 但实测：在真实 Q/K/V 下，log_softmax(.float()).exp().to(bf16) 这条路径在 row 27 出
