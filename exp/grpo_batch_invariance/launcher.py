@@ -16,25 +16,30 @@ import sys
 
 def _patch_trl_grpo_grad_accum() -> None:
     """trl >= 0.26 的 GRPOTrainer.training_step 读 self.current_gradient_accumulation_steps,
-    但 swift 4.2.1 的 GRPOTrainer 子类构造链上没把这个 attr 设进来，第一步就 AttributeError。
-    包一层 __init__ wrapper：原 init 跑完后若 attr 缺失就用 args.gradient_accumulation_steps 补。
+    但 swift 4.2.1 的 GRPOTrainer 子类构造链上没把这个 attr 设进来。包 training_step 在
+    委托给 trl 的实现前做一次 lazy backfill —— 每步都查一遍 hasattr，没有就用
+    args.gradient_accumulation_steps 补；有就 no-op。比 __init__ wrapper 稳：训练步的
+    super() 调用是运行时动态 MRO 查找，必命中我们的替换。
     """
     try:
         from trl import GRPOTrainer as TrlGRPOTrainer
     except Exception as e:
         print(f"[launcher] WARN: trl GRPOTrainer patch skipped: {e}", file=sys.stderr)
         return
-    _orig_init = TrlGRPOTrainer.__init__
+    _orig_step = TrlGRPOTrainer.training_step
+    _patched_once = {"done": False}
 
-    def _wrapped_init(self, *args, **kwargs):
-        _orig_init(self, *args, **kwargs)
+    def _wrapped_step(self, *args, **kwargs):
         if not hasattr(self, "current_gradient_accumulation_steps"):
             gas = getattr(getattr(self, "args", None), "gradient_accumulation_steps", 1)
             self.current_gradient_accumulation_steps = gas
-            print(f"[launcher] patched current_gradient_accumulation_steps={gas}",
-                  file=sys.stderr, flush=True)
+            if not _patched_once["done"]:
+                print(f"[launcher] backfilled current_gradient_accumulation_steps={gas}",
+                      file=sys.stderr, flush=True)
+                _patched_once["done"] = True
+        return _orig_step(self, *args, **kwargs)
 
-    TrlGRPOTrainer.__init__ = _wrapped_init
+    TrlGRPOTrainer.training_step = _wrapped_step
 
 
 def main() -> None:
