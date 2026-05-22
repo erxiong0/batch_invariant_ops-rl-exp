@@ -43,21 +43,26 @@ def load_gsm8k_prompts(n: int) -> List[str]:
     return [f"{sys_msg}\n\nQuestion: {x['question']}\nAnswer:" for x in ds]
 
 
-def rollout_hf(prompts: List[str]):
-    """Generate completions with HF model.generate and capture per-token logprobs.
-
-    Returns list of (gen_token_ids, gen_logprobs).
-    """
+def _load_model_and_tok():
+    """Single shared model/tokenizer instance for both rollout and forward."""
     import torch
-    import torch.nn.functional as F
     from transformers import AutoModelForCausalLM, AutoTokenizer
-
     tok = AutoTokenizer.from_pretrained(MODEL_ID)
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
     ).cuda().eval()
+    return model, tok
+
+
+def rollout_hf(model, tok, prompts: List[str]):
+    """Generate completions with HF model.generate and capture per-token logprobs.
+
+    Returns list of (gen_token_ids, gen_logprobs).
+    """
+    import torch
+    import torch.nn.functional as F
 
     torch.manual_seed(SEED)
     out: List[Tuple[List[int], List[float]]] = []
@@ -85,16 +90,10 @@ def rollout_hf(prompts: List[str]):
     return out
 
 
-def forward_hf(prompts: List[str], rollouts):
+def forward_hf(model, tok, prompts: List[str], rollouts):
     """Recompute per-token logprob via single-shot HF forward on (prompt + completion)."""
     import torch
     import torch.nn.functional as F
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    tok = AutoTokenizer.from_pretrained(MODEL_ID)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
-    ).cuda().eval()
 
     out: List[List[float]] = []
     with torch.no_grad():
@@ -122,8 +121,9 @@ def run_cell(cell: str) -> None:
         enable_extended_batch_invariant_mode()
 
     prompts = load_gsm8k_prompts(N_PROMPTS)
-    rollouts = rollout_hf(prompts)
-    train_lps = forward_hf(prompts, rollouts)
+    model, tok = _load_model_and_tok()       # 单一实例，rollout + forward 共用
+    rollouts = rollout_hf(model, tok, prompts)
+    train_lps = forward_hf(model, tok, prompts, rollouts)
 
     deltas: List[float] = []
     for (_, roll_lps), tr_lps in zip(rollouts, train_lps):
