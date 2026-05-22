@@ -28,11 +28,13 @@ from batch_invariant_ops import enable_batch_invariant_mode
 from ops_extension import enable_extended_batch_invariant_mode
 
 
+import os
+
 MODEL_ID = "Qwen/Qwen3-1.7B"
 PROMPT = ("You are a helpful math assistant. Solve the problem step by step "
           "and put your final answer within \\boxed{}.\n\n"
           "Question: What is 13 * 47?\nAnswer:")
-N_TOKENS = 10
+N_TOKENS = int(os.environ.get("VSS_N_TOKENS", "10"))
 SEED = 12345
 
 
