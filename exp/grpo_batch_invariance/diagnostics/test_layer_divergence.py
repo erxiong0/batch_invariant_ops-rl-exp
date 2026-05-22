@@ -41,10 +41,12 @@ N_PROMPT = 37     # 跟 test_attn_backend.py 一致
 def run_and_capture(model, tok, target_len: int, mode: str):
     """mode='prefill': 一次性 forward target_len 个 token，捕获 layer 输入/输出 at row target_len-1
        mode='decode' : 先 prefill (target_len-1) 个 token + 1 步 decode，捕获 decode 步 layer 输入/输出
+
+    新增：也捕获每层 attention 看到的完整 K_cache（含 0..target_len-2 历史 + 当前位置）。
+    这就能直接对比 prefill 算的 K[0..46] vs decode 用的 K_cache[0..46]。
     """
     prompt = "You are a helpful math assistant.\n\nQuestion: What is 13 * 47?\nAnswer:"
     enc = tok(prompt, return_tensors="pt").to("cuda").input_ids
-    # 截或补到 target_len
     if enc.shape[1] > target_len:
         enc = enc[:, :target_len]
     elif enc.shape[1] < target_len:
@@ -53,21 +55,19 @@ def run_and_capture(model, tok, target_len: int, mode: str):
         enc = torch.cat([enc, pad], dim=1)
     assert enc.shape[1] == target_len
 
-    captures = {"input_hidden": {}, "cos_at_target": {}, "attn_output": {}}
+    captures = {"input_hidden": {}, "cos_at_target": {}, "attn_output": {}, "k_cache_full": {}}
 
     def make_pre_hook(layer_idx: int):
         def pre_hook(module, args, kwargs):
             hidden = kwargs.get("hidden_states", args[0] if args else None)
             pos_emb = kwargs.get("position_embeddings", None)
             cos = pos_emb[0] if pos_emb is not None else None
-            # 取 target row
             if mode == "prefill":
                 row = target_len - 1
                 captures["input_hidden"][layer_idx] = hidden[:, row : row + 1, :].detach().clone()
                 if cos is not None:
                     captures["cos_at_target"][layer_idx] = cos[:, row : row + 1, :].detach().clone()
-            else:  # decode
-                # decode 时 hidden 是 (1, 1, H)
+            else:
                 captures["input_hidden"][layer_idx] = hidden.detach().clone()
                 if cos is not None:
                     captures["cos_at_target"][layer_idx] = cos.detach().clone()
@@ -75,7 +75,6 @@ def run_and_capture(model, tok, target_len: int, mode: str):
 
     def make_post_hook(layer_idx: int):
         def post_hook(module, args, kwargs, output):
-            # output: (attn_output, attn_weights) or just attn_output depending on version
             attn_out = output[0] if isinstance(output, tuple) else output
             if mode == "prefill":
                 row = target_len - 1
@@ -83,6 +82,23 @@ def run_and_capture(model, tok, target_len: int, mode: str):
             else:
                 captures["attn_output"][layer_idx] = attn_out.detach().clone()
         return post_hook
+
+    # 钩住我们的 sdpa wrapper，从内部抓 K（key 参数已经包含 cache 拼接的完整 K[0..target_len-1]）
+    from ops_extension import sdpa as sdpa_mod
+    orig_wrapper = sdpa_mod._sdpa_attention_forward_invariant
+    layer_idx_counter = {"v": 0}
+    layers_per_forward = len(model.model.layers)
+
+    def wrapped_with_capture(module, query, key, value, attention_mask, **kw):
+        # layer_idx 从 0 循环到 N-1，每次 forward 重置
+        idx = layer_idx_counter["v"] % layers_per_forward
+        layer_idx_counter["v"] += 1
+        captures["k_cache_full"][idx] = key.detach().clone()  # (B, H_kv, full_len, D)
+        return orig_wrapper(module, query, key, value, attention_mask, **kw)
+
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    saved_sdpa = ALL_ATTENTION_FUNCTIONS["sdpa"]
+    ALL_ATTENTION_FUNCTIONS["sdpa"] = wrapped_with_capture
 
     handles = []
     for i, layer in enumerate(model.model.layers):
@@ -93,15 +109,20 @@ def run_and_capture(model, tok, target_len: int, mode: str):
     try:
         with torch.no_grad():
             if mode == "prefill":
+                layer_idx_counter["v"] = 0
                 _ = model(enc)
             else:
                 # decode: prefill first target_len-1, then decode 1 step
+                layer_idx_counter["v"] = 0
                 pre = model(enc[:, : target_len - 1], use_cache=True)
+                # 重置 counter，让 decode 步的 K cache 覆盖 prefill 阶段的捕获
+                layer_idx_counter["v"] = 0
                 _ = model(enc[:, target_len - 1 : target_len],
                           past_key_values=pre.past_key_values, use_cache=True)
     finally:
         for h in handles:
             h.remove()
+        ALL_ATTENTION_FUNCTIONS["sdpa"] = saved_sdpa
 
     return captures
 
@@ -128,7 +149,7 @@ def main():
     print(f"  captured layers: {sorted(cap_decode['input_hidden'].keys())[:3]}...{sorted(cap_decode['input_hidden'].keys())[-3:]}")
 
     print(f"\n=== Layer-by-layer diff at position {TARGET_LEN-1} ===")
-    print(f"  {'layer':>5} {'input_hidden':>15} {'cos':>15} {'attn_output':>15}")
+    print(f"  {'layer':>5} {'in_hidden':>12} {'cos':>12} {'attn_out':>12} {'K_cache_max':>12} {'K_cache_argmax':>15}")
     for i in sorted(cap_prefill["input_hidden"].keys()):
         ih_p = cap_prefill["input_hidden"][i]
         ih_d = cap_decode["input_hidden"][i]
@@ -136,13 +157,26 @@ def main():
 
         cos_p = cap_prefill["cos_at_target"].get(i)
         cos_d = cap_decode["cos_at_target"].get(i)
-        cos_diff = "n/a" if cos_p is None or cos_d is None else f"{(cos_p - cos_d).abs().max().item():.3e}"
+        cos_diff_str = "n/a" if cos_p is None or cos_d is None else f"{(cos_p - cos_d).abs().max().item():.3e}"
 
         ao_p = cap_prefill["attn_output"][i]
         ao_d = cap_decode["attn_output"][i]
         ao_diff = (ao_p - ao_d).abs().max().item()
 
-        print(f"  {i:>5} {ih_diff:>15.3e} {cos_diff:>15} {ao_diff:>15.3e}")
+        # K_cache 对比：两边都应该是 (B, H_kv, target_len, D)
+        kp = cap_prefill["k_cache_full"].get(i)
+        kd = cap_decode["k_cache_full"].get(i)
+        if kp is not None and kd is not None and kp.shape == kd.shape:
+            k_diff_per_pos = (kp - kd).abs().reshape(-1, kp.shape[-2], kp.shape[-1]).amax(dim=(0, 2))  # (target_len,)
+            k_max = k_diff_per_pos.max().item()
+            k_argmax = k_diff_per_pos.argmax().item()
+            k_max_str = f"{k_max:.3e}"
+            k_argmax_str = f"pos={k_argmax}"
+        else:
+            k_max_str = "shape_mismatch"
+            k_argmax_str = f"{kp.shape if kp is not None else None} vs {kd.shape if kd is not None else None}"
+
+        print(f"  {i:>5} {ih_diff:>12.3e} {cos_diff_str:>12} {ao_diff:>12.3e} {k_max_str:>12} {k_argmax_str:>15}")
 
 
 if __name__ == "__main__":
