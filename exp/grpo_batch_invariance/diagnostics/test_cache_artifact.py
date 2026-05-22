@@ -10,6 +10,11 @@ diff 出现位置是否变化或消失。
 from __future__ import annotations
 
 import os
+import sys
+from pathlib import Path
+
+# Make `ops_extension` importable when running `python diagnostics/test_cache_artifact.py`
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 import torch.nn.functional as F
