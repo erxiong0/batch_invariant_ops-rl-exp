@@ -15,22 +15,13 @@ EXP_DIR="$REPO_ROOT/exp/grpo_batch_invariance"
 OUTPUT_DIR="$EXP_DIR/results/runs/${BIM_MODE}_seed${SEED}"
 mkdir -p "$OUTPUT_DIR"
 
-# 寻找 gsm8k plugin：env var > swift 安装目录的 examples > 仓库内 plugins/ 回退
+# 默认走我们自带的 bim_gsm8k_plugin.py —— 它在 worker import 时跑 BIM_MODE invariant 初始化
+# 和 trl GRPOTrainer attr 兜底。env var 优先（想用上游 plugin 时可覆盖）。
 if [[ -z "${GSM8K_PLUGIN:-}" ]]; then
-  SWIFT_DIR=$(python -c "import swift, os; print(os.path.dirname(swift.__file__))")
-  CANDIDATES=(
-    "${SWIFT_DIR}/../examples/train/grpo/plugin/gsm8k/gsm8k_plugin.py"
-    "${EXP_DIR}/train/plugins/gsm8k/gsm8k_plugin.py"
-  )
-  for cand in "${CANDIDATES[@]}"; do
-    if [[ -f "$cand" ]]; then
-      GSM8K_PLUGIN="$cand"
-      break
-    fi
-  done
+  GSM8K_PLUGIN="${EXP_DIR}/train/plugins/gsm8k/bim_gsm8k_plugin.py"
 fi
-if [[ -z "${GSM8K_PLUGIN:-}" || ! -f "$GSM8K_PLUGIN" ]]; then
-  echo "gsm8k_plugin.py not found. Set GSM8K_PLUGIN env var or place it under exp/grpo_batch_invariance/train/plugins/gsm8k/" >&2
+if [[ ! -f "$GSM8K_PLUGIN" ]]; then
+  echo "GSM8K plugin not found at $GSM8K_PLUGIN" >&2
   exit 1
 fi
 echo "[train_grpo] using GSM8K_PLUGIN=$GSM8K_PLUGIN" >&2
