@@ -195,6 +195,58 @@ def main():
     v_argmax = int(v_diff_per_row.argmax().item()) if v_max > 0 else -1
     print(f"  V_post_proj diff between prefills: max={v_max:.3e} at row={v_argmax}")
 
+    # --- 拆 sdpa_batch_invariant 分步，找第一步出 diff 的环节 ---
+    import math
+    import torch.nn.functional as F_
+    scale = 1.0 / math.sqrt(Q_full.shape[-1])
+
+    def step_compare(name, t_a, t_b):
+        """Compare row 27 across Lq=47 (t_a) vs Lq=48[:, :, :47, ...] (t_b slice)."""
+        # 两个 tensor 形状可能不同：t_a (1, 16, 47, ...), t_b (1, 16, 47, ...) (已截)
+        d = (t_a - t_b).abs().reshape(-1, 47, t_a.shape[-1]).amax(dim=(0, 2))
+        mx = d.max().item()
+        mxrow = int(d.argmax().item()) if mx > 0 else -1
+        print(f"    {name:>20}: max={mx:.3e} at row={mxrow}")
+
+    print(f"\n=== Stepwise breakdown of sdpa_batch_invariant (Lq=47 vs Lq=48[:,:,:47,:]) ===")
+    Q47 = Q_full[:, :, :47, :].contiguous()
+    K47 = K_full[:, :, :47, :].contiguous()
+    V47 = V_full[:, :, :47, :].contiguous()
+    Q48 = Q_full.contiguous()
+    K48 = K_full.contiguous()
+    V48 = V_full.contiguous()
+
+    with torch.no_grad():
+        # Step 1: scores = Q @ K^T * scale
+        s_47 = torch.matmul(Q47, K47.transpose(-2, -1)) * scale
+        s_48 = torch.matmul(Q48, K48.transpose(-2, -1)) * scale
+        step_compare("scores (Q@K^T*sc)", s_47, s_48[:, :, :47, :47])
+
+        # Step 2: apply triu causal mask
+        Lq47, Lk47 = 47, 47
+        m47 = torch.ones(Lq47, Lk47, device=Q47.device, dtype=torch.bool).triu(diagonal=1)
+        s_47_m = s_47.masked_fill(m47, float("-inf"))
+        Lq48, Lk48 = 48, 48
+        m48 = torch.ones(Lq48, Lk48, device=Q48.device, dtype=torch.bool).triu(diagonal=1)
+        s_48_m = s_48.masked_fill(m48, float("-inf"))
+        # 比较时 t_a 是 47 长度，t_b 是 48 截到 47x47
+        step_compare("scores+mask", s_47_m, s_48_m[:, :, :47, :47])
+
+        # Step 3: log_softmax (float32)
+        lp_47 = F_.log_softmax(s_47_m.float(), dim=-1)
+        lp_48 = F_.log_softmax(s_48_m.float(), dim=-1)
+        step_compare("log_softmax", lp_47, lp_48[:, :, :47, :47])
+
+        # Step 4: exp & cast to bf16
+        p_47 = lp_47.exp().to(Q47.dtype)
+        p_48 = lp_48.exp().to(Q48.dtype)
+        step_compare("exp -> bf16", p_47, p_48[:, :, :47, :47])
+
+        # Step 5: matmul probs @ V
+        out_47 = torch.matmul(p_47, V47)
+        out_48 = torch.matmul(p_48, V48)
+        step_compare("probs@V", out_47, out_48[:, :, :47, :])
+
 
 if __name__ == "__main__":
     main()
