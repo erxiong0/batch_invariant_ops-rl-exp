@@ -72,21 +72,19 @@ def sdpa_batch_invariant(
 
 _PATCHED = False
 _ORIGINAL_SDPA = None
+_ORIGINAL_ATTN_REGISTRY_ENTRY = None  # ALL_ATTENTION_FUNCTIONS["sdpa"] 原始函数
 # Each item: (module_name, attr_name, original_value). 用来 unpatch 时还原。
 _PATCHED_BINDINGS: List[Tuple[str, str, object]] = []
 
 
 def _rebind_in_sys_modules(original, replacement) -> List[Tuple[str, str, object]]:
     """遍历 sys.modules，把所有 module 命名空间里指向 `original` 的属性替换为
-    `replacement`。返回被替换的 (module_name, attr_name, original) 三元组。
+    `replacement`。跳过本模块以保留 _ORIGINAL_SDPA 备份。
     """
     rebound: List[Tuple[str, str, object]] = []
     for mod_name, mod in list(sys.modules.items()):
-        if mod is None:
+        if mod is None or mod_name == __name__ or mod_name == "ops_extension.sdpa":
             continue
-        # 常见名字：直接 import 的写法 `from torch.nn.functional import scaled_dot_product_attention`
-        # 别名写法：`from torch.nn.functional import scaled_dot_product_attention as sdpa`
-        # 我们只匹配 identity（is 比较），所以别名也会被命中。
         try:
             mod_vars = vars(mod)
         except TypeError:
@@ -101,27 +99,127 @@ def _rebind_in_sys_modules(original, replacement) -> List[Tuple[str, str, object
     return rebound
 
 
+def _sdpa_attention_forward_invariant(
+    module,
+    query,
+    key,
+    value,
+    attention_mask,
+    dropout: float = 0.0,
+    scaling=None,
+    is_causal=None,
+    **kwargs,
+):
+    """Drop-in replacement for transformers.integrations.sdpa_attention.sdpa_attention_forward
+    that routes through `sdpa_batch_invariant`. Mirrors the upstream impl so masking,
+    GQA, contiguous handling, and is_causal inference behave identically.
+    """
+    sdpa_kwargs = {}
+    if hasattr(module, "num_key_value_groups"):
+        try:
+            from transformers.integrations.sdpa_attention import (
+                repeat_kv,
+                use_gqa_in_sdpa,
+            )
+            if not use_gqa_in_sdpa(attention_mask, key):
+                key = repeat_kv(key, module.num_key_value_groups)
+                value = repeat_kv(value, module.num_key_value_groups)
+            else:
+                sdpa_kwargs = {"enable_gqa": True}
+        except ImportError:
+            # transformers 没装或 API 变了，退化到全展开
+            n_rep = query.shape[-3] // key.shape[-3] if key.shape[-3] != query.shape[-3] else 1
+            if n_rep > 1:
+                key = key.repeat_interleave(n_rep, dim=-3)
+                value = value.repeat_interleave(n_rep, dim=-3)
+
+    if attention_mask is not None and attention_mask.ndim == 4:
+        attention_mask = attention_mask[:, :, :, : key.shape[-2]]
+
+    query = query.contiguous()
+    key = key.contiguous()
+    value = value.contiguous()
+
+    if is_causal is None:
+        is_causal = (
+            query.shape[2] > 1
+            and attention_mask is None
+            and getattr(module, "is_causal", True)
+        )
+    if isinstance(is_causal, torch.Tensor):
+        is_causal = bool(is_causal.item())
+
+    attn_output = sdpa_batch_invariant(
+        query, key, value,
+        attn_mask=attention_mask,
+        dropout_p=dropout,
+        scale=scaling,
+        is_causal=is_causal,
+        **sdpa_kwargs,
+    )
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    return attn_output, None
+
+
+def _patch_transformers_attn_registry() -> bool:
+    """Replace ALL_ATTENTION_FUNCTIONS['sdpa'] with our batch-invariant version.
+
+    Returns True if registry was found and patched.
+    """
+    global _ORIGINAL_ATTN_REGISTRY_ENTRY
+    try:
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    except ImportError:
+        return False
+    if "sdpa" not in ALL_ATTENTION_FUNCTIONS:
+        return False
+    _ORIGINAL_ATTN_REGISTRY_ENTRY = ALL_ATTENTION_FUNCTIONS["sdpa"]
+    ALL_ATTENTION_FUNCTIONS["sdpa"] = _sdpa_attention_forward_invariant
+    return True
+
+
 def patch_sdpa(verbose: bool = True) -> None:
-    """Monkey-patch torch.nn.functional.scaled_dot_product_attention 并覆盖所有
-    已经 import 它的模块命名空间。"""
+    """Three layers of SDPA monkey-patching, in order of effectiveness:
+
+    1. Replace ALL_ATTENTION_FUNCTIONS['sdpa'] in transformers — this is the
+       actual dispatch entry that model.forward consults under attn_implementation='sdpa'.
+       Highest reliability.
+    2. Replace F.scaled_dot_product_attention — defensive, in case some code
+       path bypasses the registry.
+    3. sys.modules walk to fix any pre-imported direct bindings.
+    """
     global _PATCHED, _ORIGINAL_SDPA, _PATCHED_BINDINGS
     if _PATCHED:
         return
+
+    registry_ok = _patch_transformers_attn_registry()
     _ORIGINAL_SDPA = F.scaled_dot_product_attention
     F.scaled_dot_product_attention = sdpa_batch_invariant
     _PATCHED_BINDINGS = _rebind_in_sys_modules(_ORIGINAL_SDPA, sdpa_batch_invariant)
     _PATCHED = True
+
     if verbose:
         binding_summary = ", ".join(f"{m}.{a}" for m, a, _ in _PATCHED_BINDINGS) or "<none>"
-        print(f"[ops_extension.sdpa] patched F.scaled_dot_product_attention + "
-              f"{len(_PATCHED_BINDINGS)} sys.modules bindings: {binding_summary}",
-              file=sys.stderr, flush=True)
+        print(
+            f"[ops_extension.sdpa] patched: "
+            f"ALL_ATTENTION_FUNCTIONS['sdpa']={'yes' if registry_ok else 'no'}, "
+            f"F.scaled_dot_product_attention=yes, "
+            f"sys.modules bindings={len(_PATCHED_BINDINGS)} [{binding_summary}]",
+            file=sys.stderr, flush=True,
+        )
 
 
 def unpatch_sdpa() -> None:
-    global _PATCHED, _ORIGINAL_SDPA, _PATCHED_BINDINGS
+    global _PATCHED, _ORIGINAL_SDPA, _PATCHED_BINDINGS, _ORIGINAL_ATTN_REGISTRY_ENTRY
     if not _PATCHED:
         return
+    if _ORIGINAL_ATTN_REGISTRY_ENTRY is not None:
+        try:
+            from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+            ALL_ATTENTION_FUNCTIONS["sdpa"] = _ORIGINAL_ATTN_REGISTRY_ENTRY
+        except ImportError:
+            pass
+        _ORIGINAL_ATTN_REGISTRY_ENTRY = None
     F.scaled_dot_product_attention = _ORIGINAL_SDPA
     for mod_name, attr_name, original in _PATCHED_BINDINGS:
         mod = sys.modules.get(mod_name)
