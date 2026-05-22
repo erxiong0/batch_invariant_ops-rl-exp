@@ -99,6 +99,9 @@ def _rebind_in_sys_modules(original, replacement) -> List[Tuple[str, str, object
     return rebound
 
 
+_INVARIANT_CALL_COUNT = [0]
+
+
 def _sdpa_attention_forward_invariant(
     module,
     query,
@@ -114,6 +117,10 @@ def _sdpa_attention_forward_invariant(
     that routes through `sdpa_batch_invariant`. Mirrors the upstream impl so masking,
     GQA, contiguous handling, and is_causal inference behave identically.
     """
+    _INVARIANT_CALL_COUNT[0] += 1
+    if _INVARIANT_CALL_COUNT[0] == 1:
+        print(f"[ops_extension.sdpa] _sdpa_attention_forward_invariant CALLED for the first time "
+              f"(module={type(module).__name__})", file=sys.stderr, flush=True)
     sdpa_kwargs = {}
     if hasattr(module, "num_key_value_groups"):
         try:
@@ -164,7 +171,8 @@ def _sdpa_attention_forward_invariant(
 def _patch_transformers_attn_registry() -> bool:
     """Replace ALL_ATTENTION_FUNCTIONS['sdpa'] with our batch-invariant version.
 
-    Returns True if registry was found and patched.
+    Returns True if registry was found and patched. Also prints diagnostics about
+    the container type so we can spot AttentionInterface vs plain dict surprises.
     """
     global _ORIGINAL_ATTN_REGISTRY_ENTRY
     try:
@@ -175,6 +183,12 @@ def _patch_transformers_attn_registry() -> bool:
         return False
     _ORIGINAL_ATTN_REGISTRY_ENTRY = ALL_ATTENTION_FUNCTIONS["sdpa"]
     ALL_ATTENTION_FUNCTIONS["sdpa"] = _sdpa_attention_forward_invariant
+    # Verify the write took effect via re-read
+    readback = ALL_ATTENTION_FUNCTIONS["sdpa"]
+    container_cls = type(ALL_ATTENTION_FUNCTIONS).__name__
+    print(f"[ops_extension.sdpa] registry container={container_cls}, "
+          f"write-readback matches={readback is _sdpa_attention_forward_invariant}",
+          file=sys.stderr, flush=True)
     return True
 
 
