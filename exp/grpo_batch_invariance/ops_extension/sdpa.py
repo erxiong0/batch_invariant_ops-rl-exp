@@ -15,6 +15,7 @@ transformers/integrations/sdpa_attention.py 在 module load 时做了
 from __future__ import annotations
 
 import math
+import os
 import sys
 from typing import List, Optional, Tuple
 
@@ -100,6 +101,9 @@ def _rebind_in_sys_modules(original, replacement) -> List[Tuple[str, str, object
 
 
 _INVARIANT_CALL_COUNT = [0]
+# 诊断开关：BIM_SDPA_AS_EAGER=1 时 wrapper 直接转发给 eager_attention_forward,
+# 用来判断 16-aligned diff 是否来自 sdpa_batch_invariant 内部 vs sdpa 模式触发的其他分支
+_DELEGATE_TO_EAGER = os.environ.get("BIM_SDPA_AS_EAGER", "0") == "1"
 
 
 def _sdpa_attention_forward_invariant(
@@ -116,12 +120,31 @@ def _sdpa_attention_forward_invariant(
     """Drop-in replacement for transformers.integrations.sdpa_attention.sdpa_attention_forward
     that routes through `sdpa_batch_invariant`. Mirrors the upstream impl so masking,
     GQA, contiguous handling, and is_causal inference behave identically.
+
+    Env var BIM_SDPA_AS_EAGER=1 → 跳过我们的 sdpa_batch_invariant，直接调用 transformers
+    的 eager_attention_forward。用于 isolate 16-aligned diff 的来源。
     """
     _INVARIANT_CALL_COUNT[0] += 1
     if _INVARIANT_CALL_COUNT[0] == 1:
+        delegate_str = "yes (BIM_SDPA_AS_EAGER=1)" if _DELEGATE_TO_EAGER else "no"
         print(f"[ops_extension.sdpa] _sdpa_attention_forward_invariant CALLED for the first time "
-              f"(module={type(module).__name__}, Q={tuple(query.shape)}, K={tuple(key.shape)})",
+              f"(module={type(module).__name__}, Q={tuple(query.shape)}, K={tuple(key.shape)}, "
+              f"delegate_to_eager={delegate_str})",
               file=sys.stderr, flush=True)
+
+    if _DELEGATE_TO_EAGER:
+        # Find the model module's eager_attention_forward
+        mod_path = type(module).__module__  # e.g. transformers.models.qwen3.modeling_qwen3
+        eager_fn = getattr(sys.modules[mod_path], "eager_attention_forward", None)
+        if eager_fn is None:
+            from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+            eager_fn = ALL_ATTENTION_FUNCTIONS.get("eager")
+        if eager_fn is None:
+            raise RuntimeError(f"BIM_SDPA_AS_EAGER=1 but no eager_attention_forward found")
+        return eager_fn(
+            module, query, key, value, attention_mask,
+            dropout=dropout, scaling=scaling, **kwargs,
+        )
 
     # 强制走 repeat_kv 路径，跟 transformers eager_attention_forward 完全一致。
     # 不用 enable_gqa 旁路 —— 我们的 sdpa_batch_invariant 内部 repeat_interleave 跟
