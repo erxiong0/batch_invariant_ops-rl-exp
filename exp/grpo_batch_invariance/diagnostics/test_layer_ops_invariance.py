@@ -47,7 +47,39 @@ def test_qwen3_rmsnorm():
             print(f"  {Lk:>5} {diff:>15.3e}  {note}")
 
 
-def test_rotary():
+def test_rotary_embedding_generation():
+    """Qwen3RotaryEmbedding(position_ids) → (cos, sin) 在 position_ids shape 不同时是否不变。
+
+    这才是真正模拟 decode 和 prefill 的差别：
+      decode  : position_ids = [[Lk-1]]              （单点）
+      prefill : position_ids = [[0, 1, ..., Lk-1]]   （全部）
+    比较 prefill output 在 Lk-1 位置 vs decode output。
+    """
+    from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained("Qwen/Qwen3-1.7B")
+    rope = Qwen3RotaryEmbedding(config=config).cuda()
+
+    print(f"\n=== Qwen3RotaryEmbedding M-invariance (cache-position semantics) ===")
+    print(f"  {'Lk':>5} {'cos diff':>15} {'sin diff':>15}  note")
+    for Lk in LK_LIST:
+        # x 只用来推 dtype/device，不影响 cos/sin 计算
+        x = torch.empty(1, 1, dtype=torch.bfloat16, device="cuda")
+        pos_full = torch.arange(Lk, device="cuda").unsqueeze(0)         # (1, Lk)
+        pos_one = torch.tensor([[Lk - 1]], device="cuda")               # (1, 1)
+        with torch.no_grad():
+            cos_full, sin_full = rope(x, pos_full)
+            cos_one, sin_one = rope(x, pos_one)
+        # cos_full/sin_full shape: (1, Lk, head_dim)；取最后一行跟 cos_one 比
+        cos_diff = (cos_full[:, Lk - 1 : Lk, :] - cos_one).abs().max().item()
+        sin_diff = (sin_full[:, Lk - 1 : Lk, :] - sin_one).abs().max().item()
+        note = "← multiple of 16" if Lk % 16 == 0 else ""
+        print(f"  {Lk:>5} {cos_diff:>15.3e} {sin_diff:>15.3e}  {note}")
+
+
+def test_apply_rotary():
+    """apply_rotary_pos_emb 给定相同 cos/sin 时，对 Q[full] 取行 vs 对 Q[one] 直接旋转是否一致。"""
     from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
 
     head_dim = 128
@@ -61,7 +93,6 @@ def test_rotary():
         torch.manual_seed(42 + Lk)
         Q = torch.randn(1, num_q_heads, Lk, head_dim, dtype=torch.bfloat16, device="cuda")
         K = torch.randn(1, num_kv_heads, Lk, head_dim, dtype=torch.bfloat16, device="cuda")
-        # 在 transformers 4.54 里 cos/sin shape 是 (1, Lk, head_dim)。
         cos = torch.randn(1, Lk, head_dim, dtype=torch.bfloat16, device="cuda")
         sin = torch.randn(1, Lk, head_dim, dtype=torch.bfloat16, device="cuda")
 
@@ -82,7 +113,8 @@ def main():
     enable_batch_invariant_mode()
     enable_extended_batch_invariant_mode()
     test_qwen3_rmsnorm()
-    test_rotary()
+    test_rotary_embedding_generation()  # 真正模拟 cache-position 语义
+    test_apply_rotary()
 
 
 if __name__ == "__main__":
