@@ -14,6 +14,29 @@ import os
 import sys
 
 
+def _patch_trl_grpo_grad_accum() -> None:
+    """trl >= 0.26 的 GRPOTrainer.training_step 读 self.current_gradient_accumulation_steps,
+    但 swift 4.2.1 的 GRPOTrainer 子类构造链上没把这个 attr 设进来，第一步就 AttributeError。
+    包一层 __init__ wrapper：原 init 跑完后若 attr 缺失就用 args.gradient_accumulation_steps 补。
+    """
+    try:
+        from trl import GRPOTrainer as TrlGRPOTrainer
+    except Exception as e:
+        print(f"[launcher] WARN: trl GRPOTrainer patch skipped: {e}", file=sys.stderr)
+        return
+    _orig_init = TrlGRPOTrainer.__init__
+
+    def _wrapped_init(self, *args, **kwargs):
+        _orig_init(self, *args, **kwargs)
+        if not hasattr(self, "current_gradient_accumulation_steps"):
+            gas = getattr(getattr(self, "args", None), "gradient_accumulation_steps", 1)
+            self.current_gradient_accumulation_steps = gas
+            print(f"[launcher] patched current_gradient_accumulation_steps={gas}",
+                  file=sys.stderr, flush=True)
+
+    TrlGRPOTrainer.__init__ = _wrapped_init
+
+
 def main() -> None:
     mode = os.environ.get("BIM_MODE", "baseline").lower()
     assert mode in {"baseline", "invariant"}, f"bad BIM_MODE: {mode}"
@@ -28,6 +51,8 @@ def main() -> None:
               file=sys.stderr, flush=True)
     else:
         print(f"[launcher] baseline mode (no patches)", file=sys.stderr, flush=True)
+
+    _patch_trl_grpo_grad_accum()
 
     # 透传剩余参数给 swift CLI
     from swift.cli.main import cli_main
