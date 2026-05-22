@@ -104,6 +104,10 @@ _INVARIANT_CALL_COUNT = [0]
 # 诊断开关：BIM_SDPA_AS_EAGER=1 时 wrapper 直接转发给 eager_attention_forward,
 # 用来判断 16-aligned diff 是否来自 sdpa_batch_invariant 内部 vs sdpa 模式触发的其他分支
 _DELEGATE_TO_EAGER = os.environ.get("BIM_SDPA_AS_EAGER", "0") == "1"
+# BIM_SDPA_FORCE_CAUSAL=1：无视 transformers 给的 attention_mask，强制 is_causal=True,
+# mask 完全由 sdpa_batch_invariant 内部 triu 构造。测试 16-aligned diff 是否来自
+# transformers 在 cache_len % 16 时 mask 准备路径的不一致。
+_FORCE_CAUSAL = os.environ.get("BIM_SDPA_FORCE_CAUSAL", "0") == "1"
 
 
 def _sdpa_attention_forward_invariant(
@@ -127,9 +131,11 @@ def _sdpa_attention_forward_invariant(
     _INVARIANT_CALL_COUNT[0] += 1
     if _INVARIANT_CALL_COUNT[0] == 1:
         delegate_str = "yes (BIM_SDPA_AS_EAGER=1)" if _DELEGATE_TO_EAGER else "no"
+        force_str = "yes (BIM_SDPA_FORCE_CAUSAL=1)" if _FORCE_CAUSAL else "no"
+        mask_summary = "None" if attention_mask is None else f"shape={tuple(attention_mask.shape)} dtype={attention_mask.dtype}"
         print(f"[ops_extension.sdpa] _sdpa_attention_forward_invariant CALLED for the first time "
               f"(module={type(module).__name__}, Q={tuple(query.shape)}, K={tuple(key.shape)}, "
-              f"delegate_to_eager={delegate_str})",
+              f"attn_mask={mask_summary}, delegate_to_eager={delegate_str}, force_causal={force_str})",
               file=sys.stderr, flush=True)
 
     if _DELEGATE_TO_EAGER:
@@ -180,13 +186,23 @@ def _sdpa_attention_forward_invariant(
         is_causal = bool(is_causal.item())
 
     # K/V 已经 repeat_kv 展开成跟 Q 同 head 数；不再传 enable_gqa。
-    attn_output = sdpa_batch_invariant(
-        query, key, value,
-        attn_mask=attention_mask,
-        dropout_p=dropout,
-        scale=scaling,
-        is_causal=is_causal,
-    )
+    if _FORCE_CAUSAL:
+        # 完全无视外部 mask，sdpa_batch_invariant 内部 triu 自己构造 causal mask
+        attn_output = sdpa_batch_invariant(
+            query, key, value,
+            attn_mask=None,
+            dropout_p=dropout,
+            scale=scaling,
+            is_causal=True,
+        )
+    else:
+        attn_output = sdpa_batch_invariant(
+            query, key, value,
+            attn_mask=attention_mask,
+            dropout_p=dropout,
+            scale=scaling,
+            is_causal=is_causal,
+        )
     attn_output = attn_output.transpose(1, 2).contiguous()
     return attn_output, None
 
