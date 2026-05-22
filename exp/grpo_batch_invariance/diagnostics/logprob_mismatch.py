@@ -33,6 +33,7 @@ MODEL_ID = "Qwen/Qwen3-1.7B"
 N_PROMPTS = int(os.environ.get("BIM_N_PROMPTS", "100"))   # 默认 100；per_step 模式建议 30
 MAX_NEW = int(os.environ.get("BIM_MAX_NEW", "128"))       # 默认 128；per_step 模式建议 64
 FORWARD_MODE = os.environ.get("BIM_FORWARD", "full")      # "full" | "per_step"
+ATTN_IMPL = os.environ.get("BIM_ATTN_IMPL", "sdpa")       # "sdpa" | "eager" | "flash_attention_2"
 SEED = 12345
 
 
@@ -52,7 +53,7 @@ def _load_model_and_tok():
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
+        MODEL_ID, torch_dtype=torch.bfloat16, attn_implementation=ATTN_IMPL,
     ).cuda().eval()
     return model, tok
 
@@ -155,6 +156,7 @@ def run_cell(cell: str) -> None:
     summary = {
         "cell": cell,
         "forward_mode": FORWARD_MODE,
+        "attn_impl": ATTN_IMPL,
         "n_prompts": N_PROMPTS,
         "max_new": MAX_NEW,
         "n_tokens": len(deltas),
@@ -165,10 +167,11 @@ def run_cell(cell: str) -> None:
         "histogram_deltas": deltas[:2000],
     }
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    suffix = "" if FORWARD_MODE == "full" else f"_{FORWARD_MODE}"
-    out = RESULTS_DIR / f"cell_{cell}{suffix}.json"
+    fwd_suffix = "" if FORWARD_MODE == "full" else f"_{FORWARD_MODE}"
+    attn_suffix = "" if ATTN_IMPL == "sdpa" else f"_{ATTN_IMPL}"
+    out = RESULTS_DIR / f"cell_{cell}{fwd_suffix}{attn_suffix}.json"
     out.write_text(json.dumps(summary, indent=2))
-    print(f"[cell {cell} forward={FORWARD_MODE}] wrote {out}: mean|Δ|={summary['mean_abs_delta']:.2e} "
+    print(f"[cell {cell} forward={FORWARD_MODE} attn={ATTN_IMPL}] wrote {out}: mean|Δ|={summary['mean_abs_delta']:.2e} "
           f"frac>1e-3={summary['frac_gt_1e-3']:.3f}", file=sys.stderr)
 
 
