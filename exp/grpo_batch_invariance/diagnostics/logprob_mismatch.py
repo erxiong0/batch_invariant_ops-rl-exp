@@ -30,8 +30,9 @@ EXP_DIR = Path(__file__).resolve().parents[1]
 RESULTS_DIR = EXP_DIR / "results" / "diagnostics"
 
 MODEL_ID = "Qwen/Qwen3-1.7B"
-N_PROMPTS = 100         # HF generate is slow → smaller sample than the original 200
-MAX_NEW = 128           # ditto
+N_PROMPTS = int(os.environ.get("BIM_N_PROMPTS", "100"))   # 默认 100；per_step 模式建议 30
+MAX_NEW = int(os.environ.get("BIM_MAX_NEW", "128"))       # 默认 128；per_step 模式建议 64
+FORWARD_MODE = os.environ.get("BIM_FORWARD", "full")      # "full" | "per_step"
 SEED = 12345
 
 
@@ -91,7 +92,12 @@ def rollout_hf(model, tok, prompts: List[str]):
 
 
 def forward_hf(model, tok, prompts: List[str], rollouts):
-    """Recompute per-token logprob via single-shot HF forward on (prompt + completion)."""
+    """Recompute per-token logprob via HF forward.
+
+    BIM_FORWARD env var:
+      "full"     : 一次性 forward on [prompt + all gen tokens] (默认，快)
+      "per_step" : 每个 t 单独 forward on [prompt + first t tokens] (慢 O(N²), 但跟 decode 同 shape)
+    """
     import torch
     import torch.nn.functional as F
 
@@ -102,14 +108,24 @@ def forward_hf(model, tok, prompts: List[str], rollouts):
                 out.append([])
                 continue
             p_ids = tok(prompt, return_tensors="pt").input_ids.cuda()
-            full_ids = torch.cat([p_ids, torch.tensor([gen_ids], device="cuda")], dim=1)
-            logits = model(full_ids).logits  # (1, L, V)
             p_len = p_ids.shape[1]
-            gen_logits = logits[0, p_len - 1 : -1, :]  # (G, V)
-            gen_targets = torch.tensor(gen_ids, device="cuda")
-            log_softmax = F.log_softmax(gen_logits.float(), dim=-1)
-            lp = log_softmax.gather(-1, gen_targets.unsqueeze(-1)).squeeze(-1).cpu().tolist()
-            out.append(lp)
+
+            if FORWARD_MODE == "per_step":
+                lp: List[float] = []
+                for t in range(len(gen_ids)):
+                    context = p_ids.tolist()[0] + gen_ids[:t]
+                    ids = torch.tensor([context], device="cuda")
+                    logits = model(ids).logits[0, -1, :].float()  # (V,)
+                    lp.append(F.log_softmax(logits, dim=-1)[gen_ids[t]].item())
+                out.append(lp)
+            else:  # "full"
+                full_ids = torch.cat([p_ids, torch.tensor([gen_ids], device="cuda")], dim=1)
+                logits = model(full_ids).logits  # (1, L, V)
+                gen_logits = logits[0, p_len - 1 : -1, :]  # (G, V)
+                gen_targets = torch.tensor(gen_ids, device="cuda")
+                log_softmax = F.log_softmax(gen_logits.float(), dim=-1)
+                lp = log_softmax.gather(-1, gen_targets.unsqueeze(-1)).squeeze(-1).cpu().tolist()
+                out.append(lp)
     return out
 
 
@@ -138,6 +154,9 @@ def run_cell(cell: str) -> None:
     abs_deltas = [abs(d) for d in deltas]
     summary = {
         "cell": cell,
+        "forward_mode": FORWARD_MODE,
+        "n_prompts": N_PROMPTS,
+        "max_new": MAX_NEW,
         "n_tokens": len(deltas),
         "mean_abs_delta": statistics.mean(abs_deltas),
         "max_abs_delta": max(abs_deltas),
@@ -146,9 +165,10 @@ def run_cell(cell: str) -> None:
         "histogram_deltas": deltas[:2000],
     }
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    out = RESULTS_DIR / f"cell_{cell}.json"
+    suffix = "" if FORWARD_MODE == "full" else f"_{FORWARD_MODE}"
+    out = RESULTS_DIR / f"cell_{cell}{suffix}.json"
     out.write_text(json.dumps(summary, indent=2))
-    print(f"[cell {cell}] wrote {out}: mean|Δ|={summary['mean_abs_delta']:.2e} "
+    print(f"[cell {cell} forward={FORWARD_MODE}] wrote {out}: mean|Δ|={summary['mean_abs_delta']:.2e} "
           f"frac>1e-3={summary['frac_gt_1e-3']:.3f}", file=sys.stderr)
 
 
