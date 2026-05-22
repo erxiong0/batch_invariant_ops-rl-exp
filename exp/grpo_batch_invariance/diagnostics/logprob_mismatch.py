@@ -29,6 +29,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 EXP_DIR = Path(__file__).resolve().parents[1]
 RESULTS_DIR = EXP_DIR / "results" / "diagnostics"
 
+# Make `ops_extension` importable when running `python diagnostics/logprob_mismatch.py`
+sys.path.insert(0, str(EXP_DIR))
+
 MODEL_ID = "Qwen/Qwen3-1.7B"
 N_PROMPTS = int(os.environ.get("BIM_N_PROMPTS", "100"))   # 默认 100；per_step 模式建议 30
 MAX_NEW = int(os.environ.get("BIM_MAX_NEW", "128"))       # 默认 128；per_step 模式建议 64
