@@ -9,8 +9,10 @@ cd "$REPO_ROOT"
 
 # 1) PyTorch + cu124：torch 2.6.0 是 cu124 wheel 时代最高稳定版
 #    同时清掉 torchvision —— 旧 ABI 残留会让 transformers import 时 torchvision::nms 注册失败。
+#    也清掉 vllm —— 镜像里可能预装 vllm 0.21+ (cu13 build)，会让 trl.grpo_trainer 在
+#    eager 导入 vllm_generation 时报 libcudart.so.13 missing。本实验 --use_vllm false。
 #    本实验纯文本，不需要 torchvision；如以后要跑视觉模型再 pip install torchvision==0.21.0
-pip uninstall -y torch triton torchvision 2>/dev/null || true
+pip uninstall -y torch triton torchvision vllm 2>/dev/null || true
 pip install "torch==2.6.0" --index-url https://download.pytorch.org/whl/cu124
 
 # 2) batch_invariant_ops 本仓库（editable）
