@@ -63,11 +63,11 @@ def sdpa_batch_invariant(
         else:
             scores = scores + attn_mask
 
-    # 必须走 F.log_softmax 才能命中 batch_invariant_ops 的 aten::_log_softmax patch；
-    # aten::_softmax 没被 patch，所以 F.softmax 会跳过 batch-invariant 路径。
-    # 用 log-softmax → exp 等价数学上 = softmax(x)。
-    log_probs = F.log_softmax(scores.float(), dim=-1)
-    probs = log_probs.exp().to(query.dtype)
+    # 历史注释说 aten::_log_softmax 被 patch、_softmax 没有，所以原来选 log_softmax + exp。
+    # 但实测：在真实 Q/K/V 下，log_softmax(.float()).exp().to(bf16) 这条路径在 row 27 出
+    # 6.1e-5 diff，跟 eager 用的 F.softmax(dtype=fp32).to(bf16) 不等价（数值路径不同）。
+    # eager 在 test_attn_backend 给 0 diff，所以镜像它：用 softmax 而非 log_softmax + exp。
+    probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
     return torch.matmul(probs, value)
 
 
