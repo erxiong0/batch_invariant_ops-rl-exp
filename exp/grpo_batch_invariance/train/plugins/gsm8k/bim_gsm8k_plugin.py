@@ -36,23 +36,23 @@ def _enable_invariant_mode_if_requested() -> None:
     # vLLM rollout 侧：让每个 vLLM worker 在 init_batch_invariance() 时把
     # vllm_is_batch_invariant() 看到为 True。必须在 vLLM worker 进程构造之前设。
     # 我们这个 plugin 在 worker import 时就会跑，比 vLLM colocate init 早。
+    # 注意 colocate 模式下 vLLM 跟 trainer 共享同一进程，所以 vLLM 在 torch.library
+    # 注册的 mm/addmm/log_softmax/mean 替换对 trainer forward 也生效 — 不需要我们
+    # 重复调 batch_invariant_ops.enable_batch_invariant_mode（实测重复注册会抛
+    # RuntimeError "kernel registered twice for _log_softmax"）。
     os.environ["VLLM_BATCH_INVARIANT"] = "1"
 
-    # trainer 侧：我们自己的 batch_invariant_ops + ops_extension patches。
-    # 注意 vllm 0.11.1 内部也有一个同名 enable_batch_invariant_mode（在
-    # vllm.model_executor.layers.batch_invariant 里），它由 init_batch_invariance
-    # 在 vllm worker 启动时自动调；我们这里调的是仓库根的 batch_invariant_ops
-    # 那一个 — 同名但不同 module，两者都注册 aten op patches，并存可能在
-    # torch.library 抛 "registered twice" warning（不致命）。
+    # 仍然需要 ops_extension：它 patch 的是 transformers 类层面（Qwen3RMSNorm.forward
+    # 替换 + ALL_ATTENTION_FUNCTIONS["sdpa"] 字典项替换 + F.scaled_dot_product_attention
+    # 替换），不通过 torch.library，跟 vLLM 的 aten op patches 不冲突。
     exp_dir = Path(__file__).resolve().parents[3]  # .../exp/grpo_batch_invariance
     if str(exp_dir) not in sys.path:
         sys.path.insert(0, str(exp_dir))
-    from batch_invariant_ops import enable_batch_invariant_mode
-    enable_batch_invariant_mode()
     from ops_extension import enable_extended_batch_invariant_mode
     enable_extended_batch_invariant_mode()
     print(f"[bim_plugin] worker pid={os.getpid()} invariant mode ON "
-          f"(VLLM_BATCH_INVARIANT=1 + mm/addmm/log_softmax/mean + RMSNorm + SDPA patched)",
+          f"(VLLM_BATCH_INVARIANT=1 -> vLLM patches aten ops; ops_extension patches "
+          f"transformers RMSNorm + SDPA)",
           file=sys.stderr, flush=True)
 
 
