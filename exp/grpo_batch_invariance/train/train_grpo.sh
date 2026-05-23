@@ -43,6 +43,10 @@ export NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 export BIM_MODE
 # 关闭 fused MLP 路径（spec §1.3）
 export DISABLE_LIGER_KERNEL=1
+# vllm 0.11.1 拉的 flashinfer-python 0.5.2 跟 flashinfer-cubin 0.6.8.post1 版本不
+# 一致（pip resolver 把 cubin 拉到了更新版本），flashinfer 内部 version check 会
+# 拒绝启动；ABI 在 minor 版本内稳定，bypass 这个 check 是 vllm 官方推荐的临时方案。
+export FLASHINFER_DISABLE_VERSION_CHECK=1
 echo "[train_grpo] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES NPROC_PER_NODE=$NPROC_PER_NODE OUTPUT_DIR=$OUTPUT_DIR" >&2
 
 python "$EXP_DIR/launcher.py" rlhf \
