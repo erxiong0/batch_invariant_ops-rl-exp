@@ -84,6 +84,8 @@ python "$EXP_DIR/launcher.py" rlhf \
   --dataloader_num_workers 4 \
   --num_generations 8 \
   --temperature 1.0 \
+  --top_k 0 \
+  --top_p 1.0 \
   --system "$SYSTEM_PROMPT" \
   --deepspeed zero2 \
   --log_completions true \
