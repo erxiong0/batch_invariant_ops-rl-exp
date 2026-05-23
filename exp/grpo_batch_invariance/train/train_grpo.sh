@@ -66,7 +66,7 @@ python "$EXP_DIR/launcher.py" rlhf \
   --vllm_gpu_memory_utilization 0.4 \
   --tuner_type full \
   --torch_dtype bfloat16 \
-  --attn_impl sdpa \
+  --attn_impl flash_attention_2 \
   --use_liger_kernel false \
   --dataset 'modelscope/gsm8k' \
   --load_from_cache_file true \
