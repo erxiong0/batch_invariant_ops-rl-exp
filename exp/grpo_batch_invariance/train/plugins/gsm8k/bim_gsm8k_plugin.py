@@ -151,30 +151,31 @@ def _patch_grpo_ratio_stats() -> None:
         import torch
         import json
 
-        # Run original first (it computes per_token_logps internally and returns
-        # (loss, metrics_data)). We piggyback on its computation by re-running
-        # the same _get_per_token_logps_and_entropies inside a no_grad block
-        # to capture per_token_logps for our stats — cheap because torch caches
-        # the model outputs and the inputs slice is the same.
+        # Snapshot inputs BEFORE _orig runs — swift internally pops or rebinds
+        # rollout_per_token_logps in some code paths (e.g. chunked dispatcher
+        # via _preserved_dicts.pop), so reading it post-call would return None.
+        rollout_snapshot = inputs.get("rollout_per_token_logps")
+        old_snapshot = inputs.get("old_per_token_logps")
+        completion_mask_snapshot = inputs.get("completion_mask")
+        rollout_supplied = rollout_snapshot is not None
+        old_supplied = old_snapshot is not None
+
+        # Run original (computes per_token_logps internally, returns (loss, metrics)).
         result = _orig(self, model, inputs)
 
         try:
-            # Recompute per_token_logps for stats (no_grad, eval state unchanged).
             with torch.no_grad():
+                # Recompute per_token_logps cheaply for stats (no_grad).
                 per_token_logps, _ = self._get_per_token_logps_and_entropies(
                     model, inputs, compute_entropy=False)
 
-                completion_mask = inputs.get("completion_mask")
-                if completion_mask is None:
+                if completion_mask_snapshot is None:
                     return result
-                m = completion_mask.float()
+                m = completion_mask_snapshot.float()
                 n_tok = m.sum().clamp(min=1.0)
 
                 # --- trl-style ratio (vs old_per_token_logps) ---
-                old = inputs.get("old_per_token_logps")
-                old_supplied = old is not None
-                if old is None:
-                    old = per_token_logps.detach()
+                old = old_snapshot if old_snapshot is not None else per_token_logps.detach()
                 log_ratio_trl = per_token_logps - old
                 coef_1 = torch.exp(log_ratio_trl)
                 abs_lr_trl = log_ratio_trl.abs() * m
@@ -184,10 +185,8 @@ def _patch_grpo_ratio_stats() -> None:
                 outside_band = (((coef_1 < 1 - eps_low) | (coef_1 > 1 + eps_high)).float() * m).sum() / n_tok
 
                 # --- rollout-vs-trainer drift (Thinking Machines core claim) ---
-                rollout = inputs.get("rollout_per_token_logps")
-                rollout_supplied = rollout is not None
-                if rollout is not None:
-                    log_ratio_rollout = per_token_logps - rollout
+                if rollout_snapshot is not None:
+                    log_ratio_rollout = per_token_logps - rollout_snapshot
                     abs_lr_roll = log_ratio_rollout.abs() * m
                     mean_abs_lr_roll = float(abs_lr_roll.sum().item() / max(n_tok.item(), 1))
                     max_abs_lr_roll = float(abs_lr_roll.max().item())
