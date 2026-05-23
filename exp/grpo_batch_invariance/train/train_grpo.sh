@@ -87,6 +87,7 @@ python "$EXP_DIR/launcher.py" rlhf \
   --system "$SYSTEM_PROMPT" \
   --deepspeed zero2 \
   --log_completions true \
+  --log_rollout_offpolicy_metrics true \
   --report_to tensorboard \
   --max_grad_norm 1.0 \
   --epsilon 0.2 \
