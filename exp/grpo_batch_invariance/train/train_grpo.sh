@@ -52,7 +52,9 @@ python "$EXP_DIR/launcher.py" rlhf \
   --reward_funcs gsm8k_accuracy gsm8k_format \
   --columns '{"answer": "solution"}' \
   --enable_thinking false \
-  --use_vllm false \
+  --use_vllm true \
+  --vllm_mode colocate \
+  --vllm_gpu_memory_utilization 0.4 \
   --tuner_type full \
   --torch_dtype bfloat16 \
   --attn_impl sdpa \
