@@ -47,7 +47,12 @@ export DISABLE_LIGER_KERNEL=1
 # 一致（pip resolver 把 cubin 拉到了更新版本），flashinfer 内部 version check 会
 # 拒绝启动；ABI 在 minor 版本内稳定，bypass 这个 check 是 vllm 官方推荐的临时方案。
 export FLASHINFER_DISABLE_VERSION_CHECK=1
-echo "[train_grpo] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES NPROC_PER_NODE=$NPROC_PER_NODE OUTPUT_DIR=$OUTPUT_DIR" >&2
+# bim_gsm8k_plugin 在每个 worker 里 hook trl._compute_loss，记录 per-step 的
+# importance ratio 统计 (mean/max |ratio-1|, frac outside clip band) 到这个目录下
+# ratio_rank{N}.jsonl。是 Thinking Machines claim 的直接验证数据。
+export BIM_RATIO_LOG_DIR="$OUTPUT_DIR/ratio_stats"
+mkdir -p "$BIM_RATIO_LOG_DIR"
+echo "[train_grpo] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES NPROC_PER_NODE=$NPROC_PER_NODE OUTPUT_DIR=$OUTPUT_DIR BIM_RATIO_LOG_DIR=$BIM_RATIO_LOG_DIR" >&2
 
 python "$EXP_DIR/launcher.py" rlhf \
   --rlhf_type grpo \

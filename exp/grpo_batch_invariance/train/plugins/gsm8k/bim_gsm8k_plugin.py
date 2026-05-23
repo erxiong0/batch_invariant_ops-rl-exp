@@ -113,11 +113,117 @@ def _patch_grpo_training_step() -> None:
               file=sys.stderr, flush=True)
 
 
-# Fire both at import time. Print a banner first so a missing prefix in logs
+def _patch_grpo_ratio_stats() -> None:
+    """Hook trl GRPOTrainer to log per-step importance ratio statistics.
+
+    Thinking Machines' claim is about ratio drift between vLLM rollout (old)
+    and trainer forward (new). To verify, we need to capture coef_1 = exp(
+    per_token_logps - old_per_token_logps) from inside trl._compute_loss.
+
+    Strategy: monkey-patch _get_per_token_logps_and_entropies to stash its
+    output on self as a side effect, then wrap _compute_loss to compute ratio
+    stats AFTER the original returns (using the stashed tensor + inputs's
+    old_per_token_logps). Output goes to ${BIM_RATIO_LOG_DIR}/ratio_rank{N}.jsonl
+    if env var is set.
+    """
+    ratio_log_dir = os.environ.get("BIM_RATIO_LOG_DIR")
+    if not ratio_log_dir:
+        return  # opt-in
+    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+    log_path = Path(ratio_log_dir) / f"ratio_rank{rank}.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        from trl import GRPOTrainer as TrlGRPOTrainer
+    except Exception as e:
+        print(f"[bim_plugin] WARN: ratio stats patch skipped: {e}", file=sys.stderr, flush=True)
+        return
+
+    _orig_logps = TrlGRPOTrainer._get_per_token_logps_and_entropies
+    if not getattr(_orig_logps, "_bim_ratio_patched", False):
+        def _wrapped_logps(self, *args, **kwargs):
+            result = _orig_logps(self, *args, **kwargs)
+            # result is (per_token_logps, entropies)
+            try:
+                if isinstance(result, tuple) and len(result) >= 1:
+                    self._bim_last_per_token_logps = result[0]
+                elif isinstance(result, dict):
+                    self._bim_last_per_token_logps = result.get("per_token_logps")
+            except Exception:
+                pass
+            return result
+        _wrapped_logps._bim_ratio_patched = True  # type: ignore[attr-defined]
+        TrlGRPOTrainer._get_per_token_logps_and_entropies = _wrapped_logps
+
+    _orig_compute = TrlGRPOTrainer._compute_loss
+    if not getattr(_orig_compute, "_bim_ratio_patched", False):
+        def _wrapped_compute(self, model, inputs):
+            loss = _orig_compute(self, model, inputs)
+            try:
+                import torch
+                import json
+                per_token_logps = getattr(self, "_bim_last_per_token_logps", None)
+                old_per_token_logps = inputs.get("old_per_token_logps")
+                old_supplied = old_per_token_logps is not None
+                if per_token_logps is None:
+                    return loss
+                if old_per_token_logps is None:
+                    old_per_token_logps = per_token_logps.detach()
+
+                # mask: completion_mask × tool_mask if present
+                completion_mask = inputs.get("completion_mask")
+                if completion_mask is None:
+                    return loss
+                m = completion_mask.float()
+                if "tool_mask" in inputs and inputs["tool_mask"] is not None:
+                    m = m * inputs["tool_mask"].float()
+                n_tok = m.sum().clamp(min=1.0)
+
+                with torch.no_grad():
+                    log_ratio = per_token_logps - old_per_token_logps
+                    coef_1 = torch.exp(log_ratio)
+                    abs_lr = log_ratio.abs() * m
+                    abs_dev = (coef_1 - 1.0).abs() * m
+
+                    eps_low = float(getattr(self, "epsilon_low", 0.2))
+                    eps_high = float(getattr(self, "epsilon_high", 0.2))
+                    outside_band = (((coef_1 < 1 - eps_low) | (coef_1 > 1 + eps_high)).float() * m).sum() / n_tok
+
+                    stats = {
+                        "step": int(getattr(getattr(self, "state", None), "global_step", -1)),
+                        "rank": rank,
+                        "old_supplied": bool(old_supplied),
+                        "n_tokens": int(n_tok.item()),
+                        "mean_abs_log_ratio": float(abs_lr.sum().item() / max(n_tok.item(), 1)),
+                        "max_abs_log_ratio": float(abs_lr.max().item()),
+                        "mean_abs_ratio_minus_1": float(abs_dev.sum().item() / max(n_tok.item(), 1)),
+                        "max_abs_ratio_minus_1": float(abs_dev.max().item()),
+                        "frac_outside_clip_band": float(outside_band.item()),
+                        "epsilon_low": eps_low,
+                        "epsilon_high": eps_high,
+                    }
+                    with open(log_path, "a") as f:
+                        f.write(json.dumps(stats) + "\n")
+            except Exception as e:
+                # Don't break training if logging errs; just warn once
+                if not getattr(self, "_bim_ratio_warned", False):
+                    print(f"[bim_plugin] WARN: ratio stats logging failed: {e}",
+                          file=sys.stderr, flush=True)
+                    self._bim_ratio_warned = True
+            return loss
+        _wrapped_compute._bim_ratio_patched = True  # type: ignore[attr-defined]
+        TrlGRPOTrainer._compute_loss = _wrapped_compute
+
+    print(f"[bim_plugin] ratio stats logging ON pid={os.getpid()} rank={rank} -> {log_path}",
+          file=sys.stderr, flush=True)
+
+
+# Fire patches at import time. Print a banner first so a missing prefix in logs
 # immediately tells us the plugin wasn't loaded vs loaded-but-patch-skipped.
 print(f"[bim_plugin] loaded by pid={os.getpid()} (BIM_MODE={os.environ.get('BIM_MODE', 'baseline')})",
       file=sys.stderr, flush=True)
 _patch_grpo_training_step()
+_patch_grpo_ratio_stats()
 _enable_invariant_mode_if_requested()
 
 
